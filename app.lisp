@@ -69,15 +69,23 @@
 (conf-set 'l-current-min-scale 0.0)
 (def kers-scale 0.0)
 
-; Shutdown detection via pack voltage. When power is cut, Vin collapses well
-; before the logic rail does, which leaves time for the flash write. 40V is
-; below a 14S pack's empty cutoff, so sag in normal riding cannot reach it.
-; Re-arm level: once Vin is back above this, a new drop saves again, so a dip
-; that recovers (or a battery swap) does not disable saves for the session.
+; Shutdown detection via the ECU enable line (the connector 'EN' pin, PC4).
+; Measured on this hardware: when the vehicle powers off it removes EN and the
+; logic rail collapses, while the pack bus (Vin) is held up by the DC-link bulk
+; capacitance and never approaches 40V before the MCU dies. Vin is therefore the
+; *last* rail to fall here, not the first; EN is the leading indicator. The Vin
+; drop is kept as a secondary trigger for a true battery disconnect.
+; get-adc 2 is ADC_IND_EXT3 = PC4 on the 7.x ADC map (the 6.06 map had PC4 at
+; channel 3). Steady-state EN is ~2.64V, so 2.48 fires early with margin.
+; 40V is below a 14S pack's empty cutoff, so sag in normal riding cannot reach it.
+; Re-arm levels: once both are back up, a new drop saves again, so a dip that
+; recovers (or a battery swap) does not disable saves for the session.
+(def shutdown-en-threshold 2.48)
+(def shutdown-en-rearm 2.56)
 (def shutdown-vin-threshold 40.0)
 (def shutdown-vin-rearm 44.0)
 (def shutdown-triggered false)
-; Ignore the detector for the first second so Vin ramping up at boot cannot fire it.
+; Ignore the detector for the first second so the rails ramping up at boot cannot fire it.
 (def shutdown-arm-tick 200)
 
 ; Einmalig nach dem Einschalten Betriebsbereitschaft bestätigen
@@ -390,18 +398,26 @@
     })
 })
 
-; Check pack voltage and save odometer on shutdown. Latches on a drop, re-arms
-; once Vin recovers.
+; Latch the detector and save the odometer once.
+(defun save-odometer () {
+    (def shutdown-triggered true)
+    (eeprom-store-f 0 (to-float (sysinfo 'odometer)))
+})
+
+; Check the enable line (and pack voltage) and save the odometer on shutdown.
+; Latches on a drop, re-arms once both rails are back.
 (defun check-shutdown () {
+    (var en (get-adc 2))
     (var vin (get-vin))
     (if (> tick shutdown-arm-tick) {
-        (if (and (< vin shutdown-vin-threshold) (not shutdown-triggered)) {
-            (def shutdown-triggered true)
-            (eeprom-store-f 0 (to-float (sysinfo 'odometer)))
+        (if shutdown-triggered {
+            (if (and (> en shutdown-en-rearm) (> vin shutdown-vin-rearm))
+                (def shutdown-triggered false)
+            )
+        } {
+            (if (< en shutdown-en-threshold) (save-odometer))
+            (if (and (not shutdown-triggered) (< vin shutdown-vin-threshold)) (save-odometer))
         })
-        (if (and shutdown-triggered (> vin shutdown-vin-rearm))
-            (def shutdown-triggered false)
-        )
     })
 })
 
