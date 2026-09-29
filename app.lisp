@@ -48,12 +48,29 @@
 ; band sits at very low speed: full regen down to ~8.5 km/h, floor below that.
 ; Below the standstill cutoff the halls only give a coarse sector angle, and
 ; brake current there can turn into a slight forward pull, so the scale drops
-; to zero unconditionally — KERS on or off.
+; to zero — KERS on or off. The cut is skipped while the rider is asking for
+; drive, because l-current-min-scale is not only the brake limit: the firmware
+; also uses it to bound a drive command that opposes the present motion
+; (mc_interface_set_current_rel scales such a command by |lo_current_min|, and
+; the FOC current loop clamps iq to it as well). With the limit at zero the
+; scooter that is rolling backwards cannot be driven forward at all — the
+; throttle is treated as braking and its current collapses — until the rollback
+; stops and the drive becomes plain motoring.
 ; With 48 poles and the 0.416 m wheel: 2200 erpm ~ 7.2 km/h, 2600 ~ 8.5, 300 ~ 1.
 (def kers-fade-start-erpm 2600.0)
 (def kers-fade-end-erpm 2200.0)
 (def kers-floor 0.25)
 (def kers-hold-cutoff-erpm 300.0)
+; Net throttle-minus-brake level, in ADC units, above which the rider counts as
+; asking for drive. The ADC app zeroes anything below its own 0.15 deadband, so
+; this is already a real command.
+(def kers-drive-request-level 0.15)
+; Input-current envelope granted while the rider asks for drive at crawl. The
+; FOC bounds iq against the battery current too, and that bound is applied
+; before the motor one, so the KERS envelope (zero with KERS off, tapered to
+; zero on a full pack) would otherwise pin the torque at zero. At crawl the
+; mechanical power is far below the copper loss, so the pack still discharges.
+(def kers-drive-regen-floor -3.0)
 ; Max change in scale per 5 ms tick: engage ramps in fast but not as a step
 ; (~60 ms full sweep), and a noisy get-rpm in the fade band cannot chatter the
 ; limit. The lever command itself is additionally ramped by the ADC app
@@ -61,6 +78,13 @@
 ; (cc_ramp_step_max 0.04) and battery regen stays capped at the 0x4E2 current
 ; limit (10 A default), so the pack never sees a current step.
 (def kers-scale-slew 0.08)
+; Is the rider asking for drive? The ADC app applies its own 0.15 deadband to
+; the same net value before it issues any current, so this is the earliest
+; honest signal that a drive command is on its way.
+(defun drive-requested ()
+    (> (- (get-adc-decoded 0) (get-adc-decoded 1)) kers-drive-request-level)
+)
+
 ; The VESC keeps its config while powered, so after a lisp restart the limits
 ; would hold stale values (e.g. a regen limit armed by a handshake that the
 ; fresh script never saw). Force the safe boot state: no battery regen and no
@@ -326,14 +350,17 @@
 ; this: at low ERPM hardly any current makes it back to the battery, so the
 ; input limit never bites and the motor keeps getting full brake current right
 ; through the handover and down to standstill.
-; Target scale for the current ERPM: zero below the standstill cutoff (always —
-; this is what kills the forward pull at crawl); with KERS off, full above it
-; (the lever brake is dissipative then, l-in-current-min is 0); with KERS on,
-; the floor below the fade band, a floor-to-full ramp across the band, and full
-; above it.
+; Target scale for the current ERPM: zero below the standstill cutoff unless the
+; rider is asking for drive (that is what kills the forward pull at crawl, but a
+; zero limit also zeroes the drive that has to fight a rollback). With KERS off,
+; full above the cutoff (the lever brake is dissipative then, l-in-current-min is
+; 0); with KERS on, the floor below the fade band, a floor-to-full ramp across
+; the band, and full above it.
 (defun kers-fade-target (erpm)
     (if (< erpm kers-hold-cutoff-erpm)
-        0.0
+        (if (drive-requested)
+            1.0
+            0.0)
         (if (not kers-enabled)
             1.0
             (if (< erpm kers-fade-end-erpm)
@@ -384,6 +411,18 @@
         (- 0.0 (* (/ (to-float kers-current) 1000.0)
                   (kers-voltage-scale (* (get-vin) 1000.0))))
         0.0))
+    ; The FOC bounds iq against the battery current before it bounds it against
+    ; the motor current (mcpwm_foc.c:3646), and a forward command while the
+    ; scooter rolls backwards counts as regen there. With the envelope at or
+    ; near zero — KERS off, regen current 0, or the voltage taper on a full pack
+    ; — that bound pins the torque at zero and the throttle does nothing until
+    ; the rollback stops. Grant a small envelope while the rider asks for drive
+    ; at crawl; the mechanical power there is far below the copper loss, so the
+    ; pack still discharges rather than charging.
+    (if (and (< (abs (to-float (get-rpm))) kers-hold-cutoff-erpm)
+             (drive-requested)
+             (> target kers-drive-regen-floor))
+        (setq target kers-drive-regen-floor))
     (if (> (abs (- target kers-amps-now)) 0.05) {
         (def kers-amps-now target)
         (conf-set 'l-in-current-min target)
