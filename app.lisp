@@ -1,16 +1,16 @@
-(def dataArray_0x7E0 (array-create 8))
-(def dataArray_0x7E1 (array-create 6))
-(def dataArray_0x7E2 (array-create 8))
-(def dataArray_0x7E3 (array-create 8))
-(def dataArray_0x7E4 (array-create 8))
-(def dataArray_0x7E5 (array-create 4))
-(def dataArray_0x7E8 (array-create 8))
-(def dataArray_0x7E9 (array-create 2))
-(def dataArray_0x7EA (array-create 2))
-(def dataArray_0x7EB (array-create 1))
-(def dataArray_0x7EC (array-create 1))
-(def dataArray_0x7EE (array-create 2))
-(def dataArray_0x7EF (array-create 2))
+; ===== MIDI imports — must appear before any executable code =====
+(import "pkg::midi@://vesc_packages/lib_midi/midi.vescpkg" 'midi)
+
+; Axel F is imported from vesc_tool's built-in stock lib_files package (works
+; because vesc_tool resolves :// imports from its OWN resources). It's the
+; one song kept special-cased: every OTHER song arrives over CAN from
+; music-service immediately before it plays, so app.lisp holds no embedded
+; melody content at all — Axel F is a package reference resolved by
+; vesc_tool itself, so there's nothing to stream for it. No custom package
+; needs to be installed on the device.
+(import "pkg::midi_axelf_melody@://vesc_packages/lib_files/files.vescpkg" 'song1-track0)
+(import "pkg::midi_axelf_base@://vesc_packages/lib_files/files.vescpkg"   'song1-track1)
+
 (def can-cnt 0)
 (def statusByte_1 0x00)
 (def tick 0)
@@ -85,36 +85,63 @@
     (> (- (get-adc-decoded 0) (get-adc-decoded 1)) kers-drive-request-level)
 )
 
-; The VESC keeps its config while powered, so after a lisp restart the limits
-; would hold stale values (e.g. a regen limit armed by a handshake that the
-; fresh script never saw). Force the safe boot state: no battery regen and no
-; brake current until the loops take ownership and the vehicle asks for it.
-(conf-set 'l-in-current-min 0.0)
-(conf-set 'l-current-min-scale 0.0)
 (def kers-scale 0.0)
 
-; Shutdown detection via pack voltage. When power is cut, Vin collapses well
-; before the logic rail does, which leaves time for the flash write. 40V is
-; below a 14S pack's empty cutoff, so sag in normal riding cannot reach it.
-; Re-arm level: once Vin is back above this, a new drop saves again, so a dip
-; that recovers (or a battery swap) does not disable saves for the session.
-(def shutdown-vin-threshold 40.0)
-(def shutdown-vin-rearm 44.0)
+; Shutdown detection: ADC channel 2 sits at ~2.63V while powered and drops on
+; power loss. (Channel 3 reads ~2.23V on this unit, already below the
+; threshold, so it fired right at boot instead.)
+(def shutdown-threshold 2.48)
 (def shutdown-triggered false)
-; Ignore the detector for the first second so Vin ramping up at boot cannot fire it.
-(def shutdown-arm-tick 200)
 
-; Einmalig nach dem Einschalten Betriebsbereitschaft bestätigen
-(bufset-u8 dataArray_0x7E4 0 1)
-(bufset-u8 dataArray_0x7E4 1 100)
-(bufset-u8 dataArray_0x7E4 2 100)
-(bufset-u8 dataArray_0x7E4 3 100)
-(bufset-u8 dataArray_0x7E4 4 100)
-(bufset-u8 dataArray_0x7E4 5 100)
-(bufset-u8 dataArray_0x7E4 6 100)
-(bufset-u8 dataArray_0x7E4 7 100)
-(sleep 0.005)
-(can-send-sid 0x7E4 dataArray_0x7E4)
+; ===== Music: streamed song buffers =====
+; music-service streams a song's decoded MIDI bytes over CAN
+; (Music_Upload_Begin/Chunk/End, below) immediately before playing it, into
+; two FIXED buffers that are only ever refilled, never recreated.
+(def song-buf-max 2048)   ; headroom over the largest known track
+(def song-buf-0-len 0)
+(def song-buf-1-len 0)
+(def song-buf-0-vol 1.0)
+(def song-buf-1-vol 1.0)
+(def song-buf-0-decay 0.92)
+(def song-buf-1-decay 0.92)
+(def song-buf-0-ready false)
+(def song-buf-1-ready false)
+(def resident-song-number 0)   ; number of the song currently loaded, 0 = none
+
+; Upload-in-progress state. One track uploads at a time; Begin resets this.
+(def upload-active-slot -1)    ; 0 or 1 mid-upload, -1 when idle
+(def upload-checksum 0)        ; running sum-of-bytes mod 256
+(def upload-received 0)        ; bytes received so far for the active upload
+
+; Axel F's reserved song number — must match songs.json's "number" for the
+; "Axel F" / "source": "builtin-package" entry on the music-service side.
+(def axelf-song-number 1)
+
+; ===== Music control CAN IDs =====
+; All in the 0x4E0-0x4EF range that the VESC firmware filter passes through
+; to LispBM. ecu-service only uses 0x4E0/0x4E1/0x4E2/0x4EB/0x4EF, so the IDs
+; below are free for music control:
+;
+;   Music_Control_ID1     0x4E8  play/stop     byte0: 0x00 stop, N = play song N
+;   Music_Control_ID2     0x4E9  master volume byte0: 0..100 (percent, live)
+;   Music_Upload_Begin    0x4EC  starts a track upload (see handle-upload-begin)
+;   Music_Upload_Chunk    0x4ED  one chunk of a track upload (up to 7 bytes)
+;   Music_Upload_End      0x4EE  ends a track upload, length+checksum validated
+;
+; N on Music_Control_ID1 is checked against resident-song-number (or Axel F's
+; reserved number); a command for any other number is ignored and logged.
+;
+; Play/stop/volume (and the 0x4EF full-status request) echo playback state on
+; Music_Status (0x7E6):
+;   byte0: play state (0 = stopped, 1 = playing)
+;   byte1: current song number (0 if stopped)
+;   byte2: master volume, 0..100 %
+;
+; Upload completion echoes on Music_Upload_Status (0x7E7):
+;   byte0: song number, byte1: track slot, byte2: result
+;     (0 OK, 1 checksum mismatch, 2 length mismatch, 3 rejected)
+;   byte3: reserved
+(def music-master-vol 1.0)   ; 0.0-1.0 global multiplier, set live via 0x4E9
 
 ; Build and send ECU_status4 (0x7E3) reflecting current KERS state
 (defun send-status4 (ebs-en gear-en) {
@@ -139,6 +166,31 @@
 (defun send-ebs-get () {
     (can-send-sid 0x7E5 dataArray_0x7E5)
 })
+
+@const-start
+; Send Music_Status (0x7E6) echoing back current playback state.
+;   byte 0: play state (0 = stopped, 1 = playing)
+;   byte 1: current song number (0 if stopped)
+;   byte 2: master volume, 0..100 %
+(defun send-music-status () {
+    (bufset-u8 dataArray_0x7E6 0 (if music-playing 1 0))
+    (bufset-u8 dataArray_0x7E6 1 (if music-playing current-song 0))
+    (bufset-u8 dataArray_0x7E6 2 (to-i (* music-master-vol 100.0)))
+    (can-send-sid 0x7E6 dataArray_0x7E6)
+})
+
+; Send Music_Upload_Status (0x7E7) echoing the result of an upload.
+;   byte 0: song number, byte 1: track slot, byte 2: result
+;     (0 OK, 1 checksum mismatch, 2 length mismatch, 3 rejected)
+;   byte 3: reserved
+(defun send-upload-status (song-number track-slot result) {
+    (bufset-u8 dataArray_0x7E7 0 song-number)
+    (bufset-u8 dataArray_0x7E7 1 track-slot)
+    (bufset-u8 dataArray_0x7E7 2 result)
+    (bufset-u8 dataArray_0x7E7 3 0)
+    (can-send-sid 0x7E7 dataArray_0x7E7)
+})
+@const-end
 
 ; Map a VESC fault code onto the 0x7E1 numbering, which is the same number as
 ; the dashboard LED blink code. Unmapped faults collapse to 16, internal 15V.
@@ -215,6 +267,268 @@
     (sleep 0.005)
 })
 
+; ===== Music: runtime state (RAM) =====
+(def num-chan 4)
+; current-song is the stop/switch signal AND the number echoed on 0x7E6:
+;   0     = stopped  — track threads exit their loops when they see this
+;   N>0   = playing song N — each thread loops while (= current-song its-own-id)
+(def music-playing false)
+(def current-song 0)
+(def music-t-start (systime))
+
+; Music functions live in flash (@const-start/@const-end), not the RAM cell
+; heap: upstream alone already fills about half the heap, and the music code
+; on top of it ran the heap out. Only function definitions go in const
+; blocks — anything mutated at runtime (channels, flags, buffers) stays in RAM.
+@const-start
+
+; ===== Music: polyphony engine =====
+
+; Scale a track volume by MIDI note velocity. velocity 100 = full volume;
+; lower velocities attenuate individual notes.
+(defun vscale (vol vel) {
+    (var f (/ (to-float vel) 100.0))
+    (* vol (if (> f 1.0) 1.0 f))
+})
+
+(defun note-on (note vol decay)
+    (atomic (loopforeach ch channels {
+        (if (= (ix ch 1) 0) {
+            (var freq (* 440.0 (pow 2.0 (/ (- note 69.0) 12.0))))
+            (var v (* vol music-master-vol))   ; apply live master volume
+            (setix ch 2 freq)
+            (setix ch 3 v)
+            (setix ch 4 decay)
+            (setix ch 1 note)
+            (foc-play-tone (ix ch 0) freq v)
+            (break)
+        })
+    })))
+
+(defun note-off (note)
+    (atomic (loopforeach ch channels {
+        (if (= (ix ch 1) note) {
+            (setix ch 1 0)
+            (foc-play-tone (ix ch 0) 500 0)
+            (break)
+        })
+    })))
+
+; Exponential volume decay thread — sustain envelope for active notes
+(defun decay-loop ()
+    (loopwhile t {
+        (loopforeach ch channels
+            (atomic (if (not (= (ix ch 1) 0)) {
+                (setix ch 3 (* (ix ch 3) (ix ch 4)))
+                (foc-play-tone (ix ch 0) (ix ch 2) (ix ch 3))
+            })))
+        (sleep 0.02)
+    }))
+
+; ===== Music: playback =====
+
+; song-id is baked in at spawn time so the thread knows when to exit
+(defun play-midi-track (parser-idx volts decay song-id) {
+    (var t-delta 0.0)
+    (var midi-tdiv 100)
+    (var midi-tempo 400000)
+    (var t-offset -1.0)  ; set on first note to skip any silent intro
+    (loopwhile (= current-song song-id)
+        (match (ext-midi-parse parser-idx)
+            ((midi-header (? size) (? format) (? tracks) (? time-div)) {
+                (setq midi-tdiv time-div)
+            })
+            ((midi-track-midi (? time) (? status) (? chan) (? p1) (? p2)) {
+                (var secs (/ (* midi-tempo (to-float time)) midi-tdiv 1000000.0))
+                (setq t-delta (+ t-delta secs))
+                ; On first event, anchor t-offset so the track starts immediately
+                (if (= t-offset -1.0) (setq t-offset t-delta))
+                (var to-sleep (- (- t-delta t-offset) (secs-since music-t-start)))
+                ; Chunked sleep: wake every 50ms to check if song was stopped/changed.
+                ; Prevents a long inter-note gap from delaying the stop response.
+                (loopwhile (and (> to-sleep 0.05) (= current-song song-id)) {
+                    (sleep 0.05)
+                    (setq to-sleep (- to-sleep 0.05))
+                })
+                (if (and (> to-sleep 0.001) (= current-song song-id)) (sleep to-sleep))
+                ; Check again before firing the note — avoids the stray note after stop
+                (if (!= current-song song-id) (break))
+                (if (= status 9) (note-on p1 (vscale volts p2) decay))
+                (if (= status 8) (note-off p1))
+            })
+            ((midi-track-meta (? time) (? type) (? len) (? data)) {
+                (if (= type 81) (setq midi-tempo data))
+            })
+            (midi-error { (print "MIDI error") (break) })
+            (midi-eob (break))
+            (_ nil)   ; other events (track headers etc.) need no handling
+        )
+    )
+})
+
+(defun stop-music () {
+    (def current-song 0)        ; all track threads exit at next loop check
+    (sleep 0.05)                ; give them time to finish current sleep/parse
+    (foc-play-stop)
+    (loopforeach ch channels { (setix ch 1 0) })
+    (def music-playing false)
+})
+
+; Plays whatever's currently loaded in song-buf-0/1, according to which track
+; slots handle-upload-end has marked ready.
+(defun play-current-song () {
+    (def current-song 0)        ; stop any running tracks
+    (sleep 0.05)                ; wait before re-opening parsers
+    (if (or song-buf-0-ready song-buf-1-ready) {
+        (if song-buf-0-ready (ext-midi-open 0 song-buf-0))
+        (if song-buf-1-ready (ext-midi-open 1 song-buf-1))
+        ; Set timing reference after parsers are loaded — avoids startup delay
+        (def music-t-start (systime))
+        (def current-song resident-song-number)   ; set before spawning so threads see it immediately
+        (if song-buf-0-ready (spawn 200 play-midi-track 0 song-buf-0-vol song-buf-0-decay resident-song-number))
+        (if song-buf-1-ready (spawn 200 play-midi-track 1 song-buf-1-vol song-buf-1-decay resident-song-number))
+        (def music-playing true)
+    } {
+        (print "No song buffer ready to play")
+    })
+})
+
+; Axel F bypasses the streamed-buffer model — see the import comment at the
+; top. Same shape as play-current-song, hardcoded to the package buffers.
+(defun play-axelf () {
+    (def current-song 0)
+    (sleep 0.05)
+    (ext-midi-open 0 song1-track0)
+    (ext-midi-open 1 song1-track1)
+    (def music-t-start (systime))
+    (def current-song axelf-song-number)
+    (spawn 200 play-midi-track 0 2 0.92 axelf-song-number)
+    (spawn 200 play-midi-track 1 1.0 0.92 axelf-song-number)
+    (def music-playing true)
+})
+
+; ===== Music: song upload (streaming) =====
+; Music_Upload_Begin (0x4EC) — starts a new track upload.
+;   byte0 = song number, byte1 = track slot (0 melody/1 bass),
+;   byte2-3 = length LE u16, byte4 = volume x10, byte5 = decay x100
+(defun handle-upload-begin (data) {
+    (var song-number (bufget-u8 data 0))
+    (var track-slot  (bufget-u8 data 1))
+    (var track-len (+ (bufget-u8 data 2) (* (bufget-u8 data 3) 256)))
+    (var vol-x10 (bufget-u8 data 4))
+    (var decay-x100 (bufget-u8 data 5))
+    (if (or (> track-slot 1) (> track-len song-buf-max)) {
+        (print (list "upload begin rejected: slot" track-slot "len" track-len))
+        (send-upload-status song-number track-slot 3)
+    } {
+        ; The buffers about to be refilled may be mid-playback — stop first,
+        ; or a play-midi-track thread would read them while they're rewritten.
+        (if music-playing (stop-music))
+        ; A new song number clears BOTH track-ready flags, so a mono song
+        ; doesn't inherit a stale second track from a previous song.
+        (if (!= song-number resident-song-number) {
+            (def song-buf-0-ready false)
+            (def song-buf-1-ready false)
+        })
+        (def upload-active-slot track-slot)
+        (def upload-checksum 0)
+        (def upload-received 0)
+        (if (= track-slot 0) {
+            (def song-buf-0-len track-len)
+            (def song-buf-0-vol (/ (to-float vol-x10) 10.0))
+            (def song-buf-0-decay (/ (to-float decay-x100) 100.0))
+            (def song-buf-0-ready false)
+        } {
+            (def song-buf-1-len track-len)
+            (def song-buf-1-vol (/ (to-float vol-x10) 10.0))
+            (def song-buf-1-decay (/ (to-float decay-x100) 100.0))
+            (def song-buf-1-ready false)
+        })
+        (def resident-song-number song-number)
+    })
+})
+
+; Music_Upload_Chunk (0x4ED) — byte0 = sequence (informational only; chunks
+; are appended in arrival order), byte1-7 = up to 7 bytes.
+(defun handle-upload-chunk (data) {
+    (if (and (>= upload-active-slot 0) (> (buflen data) 1)) {
+        (var n (- (buflen data) 1))
+        (var dst (if (= upload-active-slot 0) song-buf-0 song-buf-1))
+        (looprange i 0 n {
+            (var b (bufget-u8 data (+ i 1)))
+            (if (< (+ upload-received i) song-buf-max) {
+                (bufset-u8 dst (+ upload-received i) b)
+                (def upload-checksum (mod (+ upload-checksum b) 256))
+            })
+        })
+        (def upload-received (+ upload-received n))
+    })
+})
+
+; Music_Upload_End (0x4EE) — byte0 = song number, byte1 = track slot,
+; byte2 = checksum, byte3 = reserved. Validates length+checksum and, on
+; success, marks that track slot ready to play. On failure music-service
+; retries the whole track from Begin.
+(defun handle-upload-end (data) {
+    (var song-number (bufget-u8 data 0))
+    (var track-slot  (bufget-u8 data 1))
+    (var checksum    (bufget-u8 data 2))
+    (var expected-len (if (= track-slot 0) song-buf-0-len song-buf-1-len))
+    (cond
+        ((< upload-active-slot 0) (send-upload-status song-number track-slot 3))
+        ; Must match the slot Begin opened, or a stale/reordered End could
+        ; mark the wrong slot ready using leftover length/checksum.
+        ((!= track-slot upload-active-slot) {
+            (print (list "upload end: slot mismatch, expected" upload-active-slot "got" track-slot))
+            (send-upload-status song-number track-slot 3)
+        })
+        ((!= upload-received expected-len) {
+            (print (list "upload end: length mismatch" upload-received "!=" expected-len))
+            (send-upload-status song-number track-slot 2)
+        })
+        ((!= upload-checksum checksum) {
+            (print (list "upload end: checksum mismatch" upload-checksum "!=" checksum))
+            (send-upload-status song-number track-slot 1)
+        })
+        (t {
+            (if (= track-slot 0) (def song-buf-0-ready true) (def song-buf-1-ready true))
+            (def upload-active-slot -1)
+            (send-upload-status song-number track-slot 0)
+        })
+    )
+})
+
+; Music CAN frames, called from proc-sid. data is freed by proc-sid.
+(defun proc-music (id data) {
+    ; Music_Control_ID1 (0x4E8) - play/stop
+    ; 4E8#00 = stop, 4E8#<N> = play song N (N = resident-song-number or
+    ; axelf-song-number; anything else is ignored and logged)
+    (if (= id 0x4E8u32) {
+        (var cmd (bufget-u8 data 0))
+        (cond
+            ((= cmd 0x00) (stop-music))
+            ((= cmd axelf-song-number) (play-axelf))
+            ((= cmd resident-song-number) (play-current-song))
+            (t (print (list "Music cmd" cmd "ignored: no matching resident song"))))
+        (send-music-status)
+    })
+
+    ; Music_Control_ID2 (0x4E9) - master volume
+    ; 4E9#<0..100 in hex>  (e.g. 4E9#50 = 80%)
+    (if (= id 0x4E9u32) {
+        (var vol-pct (bufget-u8 data 0))
+        (if (> vol-pct 100) (setq vol-pct 100))   ; clamp
+        (def music-master-vol (/ (to-float vol-pct) 100.0))
+        (send-music-status)
+    })
+
+    ; Music_Upload_Begin (0x4EC) / Chunk (0x4ED) / End (0x4EE)
+    (if (= id 0x4ECu32) (handle-upload-begin data))
+    (if (= id 0x4EDu32) (handle-upload-chunk data))
+    (if (= id 0x4EEu32) (handle-upload-end data))
+})
+@const-end
+
 ; Handler for SID CAN-frames
 (defun proc-sid (id data) {
 
@@ -275,6 +589,8 @@
         (send-firmware-id)
         (sleep 0.01)
         (send-config-block)
+        (sleep 0.01)
+        (send-music-status)
     })
 
     ; Control_Message_ID1 (0x4EB) - Speed limit ratio
@@ -290,6 +606,9 @@
         (print (list "Gear set:" gear))
         ; TODO: apply gear mode if needed
     })
+
+    ; Music control and song upload frames (0x4E8/0x4E9/0x4EC-0x4EE)
+    (proc-music id data)
 
     (free data)
 })
@@ -429,58 +748,121 @@
     })
 })
 
-; Check pack voltage and save odometer on shutdown. Latches on a drop, re-arms
-; once Vin recovers.
+; Save the odometer once when the shutdown signal drops (power loss)
 (defun check-shutdown () {
-    (var vin (get-vin))
-    (if (> tick shutdown-arm-tick) {
-        (if (and (< vin shutdown-vin-threshold) (not shutdown-triggered)) {
-            (def shutdown-triggered true)
-            (eeprom-store-f 0 (to-float (sysinfo 'odometer)))
-        })
-        (if (and shutdown-triggered (> vin shutdown-vin-rearm))
-            (def shutdown-triggered false)
-        )
+    (var v (get-adc 2))
+    (if (and (< v shutdown-threshold) (not shutdown-triggered)) {
+        (def shutdown-triggered true)
+        (eeprom-store-f 0 (to-float (sysinfo 'odometer)))
     })
 })
 
-; Spawn the event handler thread and pass the ID it returns to C
-(event-register-handler (spawn 150 event-handler))
+; ===== Boot =====
+; image-save stores everything defined above in flash; from the next boot on the
+; firmware re-creates that environment and calls main instead of parsing this
+; file again. That is what lets the @const blocks above survive a power-on
+; boot (re-parsing rewrote them and failed). Everything that touches hardware or
+; must be fresh each boot (CAN buffers, config, native libs, threads) lives in
+; main, since none of that is restored from the image.
+(defun main () {
+    (def dataArray_0x7E0 (array-create 8))
+    (def dataArray_0x7E1 (array-create 6))
+    (def dataArray_0x7E2 (array-create 8))
+    (def dataArray_0x7E3 (array-create 8))
+    (def dataArray_0x7E4 (array-create 8))
+    (def dataArray_0x7E5 (array-create 4))
+    (def dataArray_0x7E6 (array-create 3))   ; music: Music_Status
+    (def dataArray_0x7E7 (array-create 4))   ; music: Music_Upload_Status
+    (def dataArray_0x7E8 (array-create 8))
+    (def dataArray_0x7E9 (array-create 2))
+    (def dataArray_0x7EA (array-create 2))
+    (def dataArray_0x7EB (array-create 1))
+    (def dataArray_0x7EC (array-create 1))
+    (def dataArray_0x7EE (array-create 2))
+    (def dataArray_0x7EF (array-create 2))
 
-; Enable the CAN event for SID frames
-(event-enable 'event-can-sid)
+    (def song-buf-0 (array-create song-buf-max))  ; track slot 0: melody
+    (def song-buf-1 (array-create song-buf-max))  ; track slot 1: bass
+    (def channels (map (fn (x) (list x 0 0 0 0)) (range num-chan)))
 
-; Restore odometer from EEPROM
-(def saved-odo (eeprom-read-f 0))
-(if saved-odo
-    (set-odometer (to-i saved-odo))
-)
+    ; The VESC keeps its config while powered, so after a lisp restart the limits
+    ; would hold stale values (e.g. a regen limit armed by a handshake that the
+    ; fresh script never saw). Force the safe boot state: no battery regen and no
+    ; brake current until the loops take ownership and the vehicle asks for it.
+    (conf-set 'l-in-current-min 0.0)
+    (conf-set 'l-current-min-scale 0.0)
 
-; Send initial status4 as not-kers (ebs_disabled)
-(send-status4 0 1)
-
-; Broadcast identity and config at boot. Nothing requests 0x4EF on its own
-; unless a fault was reported first.
-(sleep 0.01)
-(send-firmware-id)
-(sleep 0.01)
-(send-config-block)
-
-; Main loop: 5ms tick, shutdown check and KERS fade every tick, CAN stats every
-; 40th tick (200ms), status2 every 200th (1s). A fault repeated faster than 1Hz
-; keeps resetting the
-; consumer's 0.5s request timer, so it never asks for the state that would
-; clear the fault.
-(loopwhile t {
-    (check-shutdown)
-    (update-kers-fade)
-    (update-kers-current)
-    (if (= (mod tick 40) 0) {
-        (send_stats)
-    })
-    (if (= (mod tick 200) 0) {
-        (send-status2)
-    })
-    (def tick (+ tick 1))
+    ; Einmalig nach dem Einschalten Betriebsbereitschaft bestätigen
+    (bufset-u8 dataArray_0x7E4 0 1)
+    (bufset-u8 dataArray_0x7E4 1 100)
+    (bufset-u8 dataArray_0x7E4 2 100)
+    (bufset-u8 dataArray_0x7E4 3 100)
+    (bufset-u8 dataArray_0x7E4 4 100)
+    (bufset-u8 dataArray_0x7E4 5 100)
+    (bufset-u8 dataArray_0x7E4 6 100)
+    (bufset-u8 dataArray_0x7E4 7 100)
     (sleep 0.005)
+    (can-send-sid 0x7E4 dataArray_0x7E4)
+
+    (load-native-lib midi)
+    (ext-midi-init 2) ; 2 simultaneous MIDI parsers = max 2 tracks per song
+
+    ; Sustain envelope for the music engine
+    (spawn 200 decay-loop)
+
+    ; Spawn the event handler thread and pass the ID it returns to C
+    (event-register-handler (spawn 150 event-handler))
+
+    ; Enable the CAN event for SID frames
+    (event-enable 'event-can-sid)
+
+    ; Restore odometer from EEPROM
+    (def saved-odo (eeprom-read-f 0))
+    (if saved-odo
+        (set-odometer (to-i saved-odo))
+    )
+
+    ; Send initial status4 as not-kers (ebs_disabled)
+    (send-status4 0 1)
+
+    ; Broadcast identity and config at boot. Nothing requests 0x4EF on its own
+    ; unless a fault was reported first.
+    (sleep 0.01)
+    (send-firmware-id)
+    (sleep 0.01)
+    (send-config-block)
+
+    ; Song list lives in music-service (`music songs`), not here.
+    (print "app.lisp loaded")
+
+    ; Main loop: 5ms tick, shutdown check and KERS fade every tick, CAN stats every
+    ; 40th tick (200ms), status2 every 200th (1s). A fault repeated faster than 1Hz
+    ; keeps resetting the
+    ; consumer's 0.5s request timer, so it never asks for the state that would
+    ; clear the fault.
+    (loopwhile t {
+        (check-shutdown)
+        (update-kers-fade)
+        (update-kers-current)
+        (if (= (mod tick 40) 0) {
+            (send_stats)
+        })
+        (if (= (mod tick 200) 0) {
+            (send-status2)
+        })
+        (def tick (+ tick 1))
+        (sleep 0.005)
+    })
 })
+
+; LispBM loads some library helpers from source on first use. Done after an
+; image boot, that load writes into the image's flash area at whatever spot is
+; next, which a previous boot may already have filled differently ("already
+; occupied") and kills the calling thread. Touch every such helper the code
+; uses at runtime now, so they are baked into the image instead.
+(list abs loopforeach looprange loopwhile)
+
+(image-save)
+
+; Start now as well; on later boots the firmware calls main itself.
+(main)
