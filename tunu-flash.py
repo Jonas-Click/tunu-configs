@@ -8,7 +8,7 @@ scooter CAN bus at 125 kbit/s with node id 70 (0x46). This script speaks the
 VESC CAN transport (raw SocketCAN, python3 stdlib only, no pip deps) so it runs
 directly on the MDB.
 
-The VESC only answers while engine power is on. Every subcommand except
+The VESC only answers while engine power is on. Every CAN subcommand except
 `engine` powers the engine on first, waits ~6 s for the VESC to appear, and
 turns it back off afterwards (even on failure). Use --no-engine to skip that
 if power is already on, or --keep-engine to leave it on. The vehicle stays
@@ -20,7 +20,10 @@ Usage (copy to the MDB, e.g. scp to deep-blue:/data/, then run there):
     tunu-flash.py repl "(get-vin)"            run one REPL expression, print reply
     tunu-flash.py stats                       lisp engine stats + global bindings
     tunu-flash.py read > current.lisp         read back the installed script
-    tunu-flash.py write app.lisp              erase + chunked write + verify + run
+    tunu-flash.py read --blob > backup.blob   preserve source and all imports
+    tunu-flash.py build app.lisp -o app.img   build offline (see FLASHING.md)
+    tunu-flash.py write --image app.img       upload a validated, prebuilt image
+    tunu-flash.py write app.lisp              resolve imports + upload + verify
     tunu-flash.py output off [seconds]        disable app throttle output (default 120 s)
     tunu-flash.py output on                   re-enable app throttle output
     tunu-flash.py engine on|off               just toggle engine power via lsc
@@ -50,6 +53,10 @@ even with no script installed.
 import argparse
 import errno
 import os
+from pathlib import Path
+import re
+import json
+import zlib
 import socket
 import struct
 import subprocess
@@ -378,16 +385,181 @@ def cmd_read(v):
     return bytes(out)
 
 
-def build_image(source_bytes):
-    """Wrap raw lisp source as the flash image VESC Tool writes:
-    [len_u32][crc_u16][flags_u16][blob], blob = source + NUL + u16 import
-    count (0; import tables are not supported here), crc = crc16(flags_bytes
-    + blob). Verified byte-identical against an image VESC Tool installed."""
-    blob = source_bytes + b"\x00" + b"\x00\x00"
+# STM32 VESC Tool upload limit, including the size/CRC/flags header.
+MAX_IMAGE_SIZE = 128 * 1024 - 6
+MAX_PACKAGE_SIZE = 16 * 1024 * 1024
+
+
+def source_imports(source_bytes):
+    """Read literal (import \"path\" 'tag) forms, ignoring comments and strings."""
+    if b"\x00" in source_bytes:
+        raise ValueError("source contains NUL")
+    tokens = re.findall(r';[^\n]*|"(?:\\.|[^"\\])*"|[()\']|[^\s()\'";]+',
+                        source_bytes.decode("utf-8"))
+    tokens = [t for t in tokens if not t.startswith(";")]
+    imports = []
+    seen = set()
+    for i in range(len(tokens) - 1):
+        if tokens[i] != "(" or tokens[i + 1].lower() != "import":
+            continue
+        form = tokens[i:i + 6]
+        if (len(form) != 6 or not form[2].startswith('"') or
+                form[3] != "'" or form[5] != ")" or
+                not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", form[4])):
+            raise ValueError("imports require a literal path and quoted ASCII tag")
+        path, tag = json.loads(form[2]), form[4]
+        if not path or "\x00" in path or tag in seen:
+            raise ValueError("empty import path or duplicate tag: %s" % tag)
+        seen.add(tag)
+        imports.append((path, tag))
+    return imports
+
+
+def unpack_blob(blob):
+    """Decode firmware READ_CODE data; imported bytes include their trailing NUL."""
+    end = blob.find(b"\x00")
+    if end < 0 or end + 3 > len(blob):
+        raise ValueError("missing source terminator or import count")
+    count = struct.unpack_from(">H", blob, end + 1)[0]
+    if count >= 500:
+        raise ValueError("too many imports")
+    pos = end + 3
+    entries = []
+    seen = set()
+    for _ in range(count):
+        stop = blob.find(b"\x00", pos)
+        if stop <= pos or stop + 9 > len(blob):
+            raise ValueError("truncated import table")
+        name = blob[pos:stop].decode("ascii")
+        offset, length = struct.unpack_from(">II", blob, stop + 1)
+        if name in seen or offset % 4 or length < 1 or offset + length > len(blob):
+            raise ValueError("invalid import entry: %s" % name)
+        seen.add(name)
+        entries.append((name, offset, length))
+        pos = stop + 9
+    imports = {}
+    for name, offset, length in entries:
+        if offset < pos or blob[offset + length - 1] != 0:
+            raise ValueError("overlapping or unterminated import: %s" % name)
+        imports[name] = blob[offset:offset + length]
+        pos = offset + length
+    return blob[:end], imports
+
+
+def package_lisp(data):
+    """Extract lispData from Qt qCompress VESC packages, without Qt dependencies."""
+    if len(data) < 5:
+        raise ValueError("truncated VESC package")
+    size = struct.unpack_from(">I", data)[0]
+    if size > MAX_PACKAGE_SIZE:
+        raise ValueError("VESC package exceeds size limit")
+    decoder = zlib.decompressobj()
+    raw = decoder.decompress(data[4:], size + 1)
+    if len(raw) != size or not decoder.eof or decoder.unused_data:
+        raise ValueError("invalid compressed VESC package")
+    magic = b"VESC Packet\x00"
+    if not raw.startswith(magic):
+        raise ValueError("invalid VESC package magic")
+    pos, lisp = len(magic), None
+    while pos < len(raw):
+        end = raw.find(b"\x00", pos)
+        if end <= pos or end + 5 > len(raw):
+            raise ValueError("truncated package field")
+        length = struct.unpack_from(">I", raw, end + 1)[0]
+        start = end + 5
+        if start + length > len(raw):
+            raise ValueError("package field out of bounds")
+        if raw[pos:end] == b"lispData":
+            if lisp is not None:
+                raise ValueError("duplicate lispData field")
+            lisp = raw[start:start + length]
+        pos = start + length
+    if lisp is None:
+        raise ValueError("package has no lispData")
+    # Package lispData includes the flags; READ_CODE blobs do not.
+    if lisp.startswith(b"\x00\x00"):
+        lisp = lisp[2:]
+    return unpack_blob(lisp)
+
+
+def resolve_import(path, base_dir, resource_root):
+    member = None
+    package = False
+    if path.startswith("pkg::"):
+        member, sep, path = path[5:].partition("@")
+        if not member or not sep:
+            raise ValueError("invalid package import")
+        package = True
+    elif path.startswith("pkg@"):
+        path, package = path[4:], True
+    if path.startswith("://"):
+        if resource_root is None:
+            raise ValueError("resource import needs --resource-root or --import: %s" % path)
+        root = Path(resource_root).resolve()
+        file_path = (root / path[3:]).resolve()
+        if root not in file_path.parents:
+            raise ValueError("resource path escapes resource root")
+    else:
+        file_path = Path(base_dir) / path
+    data = file_path.read_bytes()
+    if not package:
+        return data + b"\x00"
+    source, imports = package_lisp(data)
+    if member is None:
+        return source + b"\x00"
+    if member not in imports:
+        raise ValueError("package member not found: %s" % member)
+    return imports[member]
+
+
+def image_from_blob(blob):
+    unpack_blob(blob)
     flags = b"\x00\x00"
-    crc = crc16(flags + blob)
-    header = be32(len(blob)) + be16(crc) + flags
-    return header + blob, blob
+    image = be32(len(blob)) + be16(crc16(flags + blob)) + flags + blob
+    if len(image) > MAX_IMAGE_SIZE:
+        raise ValueError("Lisp image exceeds STM32 flash capacity")
+    return image, blob
+
+
+def validate_image(image):
+    if len(image) < 11 or len(image) > MAX_IMAGE_SIZE:
+        raise ValueError("invalid image size")
+    size, crc, flags = struct.unpack_from(">IHH", image)
+    if size != len(image) - 8 or flags != 0 or crc16(image[6:]) != crc:
+        raise ValueError("invalid image size, CRC or flags")
+    source, imports = unpack_blob(image[8:])
+    required = {tag for _, tag in source_imports(source)}
+    if required != imports.keys():
+        raise ValueError("source imports do not match image table")
+    return image[8:]
+
+
+def build_image(source_bytes, base_dir=".", resource_root=None, overrides=None):
+    """Pack source/imports using VESC Tool's aligned (name, offset, length) table."""
+    overrides = overrides or {}
+    specs = source_imports(source_bytes)
+    if len(specs) >= 500:
+        raise ValueError("too many imports")
+    unused = overrides.keys() - {tag for _, tag in specs}
+    if unused:
+        raise ValueError("unused import overrides: %s" % sorted(unused))
+    imports = []
+    for path, tag in specs:
+        data = (Path(overrides[tag]).read_bytes() + b"\x00" if tag in overrides else
+                resolve_import(path, base_dir, resource_root))
+        imports.append((tag.encode("ascii"), data))
+    blob = bytearray(source_bytes + b"\x00" + be16(len(imports)))
+    offset = len(blob) + sum(len(tag) + 9 for tag, _ in imports)
+    payload = bytearray()
+    for tag, data in imports:
+        padding = (-offset) % 4
+        payload.extend(b"\x00" * padding)
+        offset += padding
+        blob.extend(tag + b"\x00" + be32(offset) + be32(len(data)))
+        payload.extend(data)
+        offset += len(data)
+    blob.extend(payload)
+    return image_from_blob(bytes(blob))
 
 
 def cmd_output_disable(v, ms):
@@ -414,7 +586,12 @@ def cmd_erase(v):
 
 
 def cmd_write(v, source_bytes, progress=True):
-    image, blob = build_image(source_bytes)
+    image, _ = build_image(source_bytes)
+    return cmd_write_image(v, image, progress)
+
+
+def cmd_write_image(v, image, progress=True):
+    blob = validate_image(image)
     # WRITE_CODE payload = [131, offset_u32, ...chunk]; keep well under 512.
     chunk = 384
     ofs = 0
@@ -478,13 +655,56 @@ def main():
     sub.add_parser("version")
     p = sub.add_parser("repl"); p.add_argument("expr")
     sub.add_parser("stats")
-    sub.add_parser("read")
-    p = sub.add_parser("write"); p.add_argument("file")
+    p = sub.add_parser("read")
+    p.add_argument("--blob", action="store_true", help="include the import table and data")
+    for name in ("write", "build"):
+        p = sub.add_parser(name)
+        p.add_argument("file")
+        p.add_argument("--resource-root", help="directory containing vesc_packages/")
+        p.add_argument("--import", dest="imports", action="append", default=[],
+                       metavar="TAG=FILE", help="use a local raw file for an import tag")
+        if name == "write":
+            p.add_argument("--image", action="store_true", help="upload a prebuilt image")
+            p.add_argument("--keep-output-disabled", action="store_true",
+                           help="leave the 120-second throttle inhibition active after upload")
+        else:
+            p.add_argument("-o", "--output", required=True)
+            p.add_argument("--blob", action="store_true", help="wrap a READ_CODE backup as an image")
     p = sub.add_parser("output")
     p.add_argument("state", choices=["on", "off"])
     p.add_argument("seconds", nargs="?", type=int, default=120)
     p = sub.add_parser("engine"); p.add_argument("state", choices=["on", "off"])
     args = ap.parse_args()
+
+    # Resolve and validate everything before power changes, output inhibition or erase.
+    image = None
+    if args.cmd in ("build", "write"):
+        overrides = {}
+        for spec in args.imports:
+            tag, sep, path = spec.partition("=")
+            if not sep or not path or tag in overrides:
+                ap.error("--import requires unique TAG=FILE entries")
+            overrides[tag] = path
+        try:
+            source = Path(args.file).read_bytes()
+            prebuilt = getattr(args, "image", False) or getattr(args, "blob", False)
+            if prebuilt and (overrides or args.resource_root):
+                raise ValueError("prebuilt input cannot use import options")
+            if getattr(args, "image", False):
+                image = source
+                validate_image(image)
+            elif getattr(args, "blob", False):
+                image, _ = image_from_blob(source)
+                validate_image(image)
+            else:
+                image, _ = build_image(source, Path(args.file).resolve().parent,
+                                       args.resource_root, overrides)
+        except (ValueError, OSError, zlib.error) as error:
+            ap.error(str(error))
+        if args.cmd == "build":
+            Path(args.output).write_bytes(image)
+            print("built %d-byte image" % len(image), file=sys.stderr)
+            return 0
 
     # `engine` subcommand is a thin wrapper, no CAN.
     if args.cmd == "engine":
@@ -535,10 +755,13 @@ def main():
 
         elif args.cmd == "read":
             blob = cmd_read(v)
-            source = blob.split(b"\x00", 1)[0]
-            sys.stdout.buffer.write(source)
-            if source and not source.endswith(b"\n"):
-                sys.stdout.buffer.write(b"\n")
+            if args.blob:
+                sys.stdout.buffer.write(blob)
+            else:
+                source = blob.split(b"\x00", 1)[0]
+                sys.stdout.buffer.write(source)
+                if source and not source.endswith(b"\n"):
+                    sys.stdout.buffer.write(b"\n")
 
         elif args.cmd == "write":
             # Refuse to write unless the target answers version first.
@@ -550,8 +773,6 @@ def main():
             else:
                 sys.stderr.write("target: fw %d.%02d hw '%s'\n"
                                  % (info["major"], info["minor"], info["hw_name"]))
-                with open(args.file, "rb") as f:
-                    source = f.read()
                 # The physical throttle is live whenever the ECU is powered
                 # (app_to_use=5). Kill app output before touching anything so
                 # a twist during the upload cannot move the motor.
@@ -559,26 +780,31 @@ def main():
                 if not cmd_output_disable(v, 120000):
                     raise IOError("aborting: (app-disable-output 120000) did not confirm")
                 sys.stderr.write("stopping lisp...\n")
-                cmd_set_running(v, False)
+                if not cmd_set_running(v, False):
+                    raise IOError("failed to stop Lisp")
                 sys.stderr.write("erasing...\n")
                 if not cmd_erase(v):
                     raise IOError("erase failed")
-                sys.stderr.write("writing %d bytes of source...\n" % len(source))
-                blob = cmd_write(v, source)
+                sys.stderr.write("writing %d-byte image...\n" % len(image))
+                blob = cmd_write_image(v, image)
                 sys.stderr.write("verifying...\n")
                 back = cmd_read(v)
                 if back != blob:
                     raise IOError("verify mismatch: read %d bytes, expected %d"
                                   % (len(back), len(blob)))
                 sys.stderr.write("restarting lisp...\n")
-                cmd_set_running(v, True)
-                sys.stderr.write("re-enabling app output...\n")
-                time.sleep(1.0)  # REPL rate limit, and let the new script boot
-                if cmd_output_disable(v, 0):
-                    sys.stderr.write("done.\n")
+                if not cmd_set_running(v, True):
+                    raise IOError("failed to start Lisp")
+                if args.keep_output_disabled:
+                    sys.stderr.write("done; app output remains inhibited until the 120 s timeout\n")
                 else:
-                    sys.stderr.write("done, but re-enable did not confirm; "
-                                     "output returns when the 120 s window expires\n")
+                    sys.stderr.write("re-enabling app output...\n")
+                    time.sleep(1.0)  # REPL rate limit, and let the new script boot
+                    if cmd_output_disable(v, 0):
+                        sys.stderr.write("done.\n")
+                    else:
+                        sys.stderr.write("done, but re-enable did not confirm; "
+                                         "output returns when the 120 s window expires\n")
     finally:
         v.close()
         if manage_engine and not args.keep_engine:
