@@ -348,6 +348,9 @@
             })
             ((midi-track-meta (? time) (? type) (? len) (? data)) {
                 (if (= type 81) (setq midi-tempo data))
+                ; End of Track: stop here. The song buffers are reused, so
+                ; past the end of a shorter track lie the old song's bytes.
+                (if (= type 47) (break))
             })
             (midi-error { (print "MIDI error") (break) })
             (midi-eob (break))
