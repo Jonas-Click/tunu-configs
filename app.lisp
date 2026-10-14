@@ -202,10 +202,7 @@
 ;   byte 1   = reserved
 ;   bytes 2-5 = fault code (u32, big-endian)
 (defun send-status2 () {
-    ; No FET temperature sensor on this controller: get-temp-fet reads a
-    ; floating ADC and climbs into triple digits. Pin a plausible ambient
-    ; 25 °C instead of 0, which still reads as freezing to consumers.
-    (bufset-i8 dataArray_0x7E1 0 25)
+    (bufset-i8 dataArray_0x7E1 0 (to-i (get-temp-fet)))
     (bufset-u8 dataArray_0x7E1 1 0)
     (bufset-u32 dataArray_0x7E1 2 (map-vesc-fault (get-fault)))
     (can-send-sid 0x7E1 dataArray_0x7E1)

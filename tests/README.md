@@ -1,10 +1,13 @@
-# Current-limit tests
+# Lisp policy and telemetry tests
 
 Run with Python 3 and a host LispBM REPL:
 
 ```sh
 python3 tests/test_drive_limits.py --repl /path/to/lispBM/repl/repl
+python3 tests/test_temperature.py --repl /path/to/lispBM/repl/repl
 ```
+
+The TUNU 1.1 temperature test verifies that CAN status reports the firmware's measured FET temperature, including cold and overtemperature readings, while preserving the fault and reserved fields.
 
 The runner extracts the current-limit definitions from `app.lisp` and executes them in LispBM with mocked ADC, RPM, voltage and configuration IO. It does not execute the application startup or contact hardware.
 
