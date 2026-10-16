@@ -2,7 +2,7 @@
 
 These rules reconcile TUNU runtime limits when engine power turns on or a battery is inserted, removed or changes state. They require Librescoot event-service and Python 3 on the MDB.
 
-The policy selects **150 A total battery current** only when both packs are present and active; otherwise it selects **80 A**. These are installation-specific limits, not a hardware rating. Battery admission remains battery-service's responsibility. This extension neither activates a pack nor changes engine power.
+The policy selects **150 A total battery current by default**, configurable down to 80 A, only when both packs are present and active; otherwise it selects **80 A**. These are installation-specific limits, not a hardware rating. Battery admission remains battery-service's responsibility. This extension neither activates a pack nor changes engine power.
 
 The helper uses CAN sender **251**, separate from ECU-service's 252 and the uploader's default 253. Install the current `tunu-flash.py`: its receive filter excludes broadcast traffic, and its REPL pacing respects the firmware's command interval.
 
@@ -29,15 +29,17 @@ journalctl -t tunu-battery-current --no-pager -n 20
 
 `lsc ext test` is a dry run. Running the helper can change live battery-current and explicitly configured power limits. It never writes configuration to flash. Confirm the intended limits before enabling it on a vehicle.
 
-## Optional power ceiling
+## Per-installation limits
 
-Without `/data/extensions/battery-current.json`, the helper preserves the existing power ceiling. To explicitly select 8 kW on an installation validated for it:
+Without `/data/extensions/battery-current.json`, the helper preserves the existing power ceiling and uses the default 150 A dual-pack ceiling. To explicitly select 7 kW and 120 A combined on an installation validated for it:
 
 ```json
-{"power_max_w": 8000}
+{"power_max_w": 7000, "dual_current_a": 120}
 ```
 
-The helper reapplies this ceiling after power-on, alongside the battery-count limit. Motor current, regenerative limits, thermal protection and motor calibration are unchanged. A power ceiling and battery-current ceiling both apply: at 55 V, 5 kW corresponds to about 91 A and 8 kW to about 145 A. The 80 A single-pack limit still bounds battery draw when an 8 kW power ceiling is configured.
+Both fields are optional. `dual_current_a` accepts 80 to 150 A; single-pack operation remains limited to 80 A. This is a fixed ceiling, not a timed boost or continuous/peak-current policy.
+
+The helper reapplies these limits after power-on and battery-state changes. Motor current, regenerative limits, thermal protection and motor calibration are unchanged. A power ceiling and battery-current ceiling both apply: at 55 V, 5 kW corresponds to about 91 A and 8 kW to about 145 A. The 80 A single-pack limit still bounds battery draw when an 8 kW power ceiling is configured.
 
 The repository's `vesc_mcconf.xml` and `3kw-vesc_mcconf.xml` both specify 210 A motor current. Motor phase current is a separate limit from battery input current; changing the battery count alone does not require raising motor current.
 

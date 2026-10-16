@@ -44,8 +44,8 @@ def read_state():
     return values
 
 
-def target_current(values):
-    return 150 if values[1:] == ['true', 'active', 'true', 'active'] else 80
+def target_current(values, dual_amps=150):
+    return dual_amps if values[1:] == ['true', 'active', 'true', 'active'] else 80
 
 
 def load_transport():
@@ -56,17 +56,19 @@ def load_transport():
     return module
 
 
-def load_power_limit(path):
-    if not path.exists():
-        return None
-    settings = json.loads(path.read_text())
-    if set(settings) - {'power_max_w'}:
+def load_limits(path):
+    settings = json.loads(path.read_text()) if path.exists() else {}
+    if not isinstance(settings, dict) or set(settings) - {'power_max_w', 'dual_current_a'}:
         raise ValueError('unknown battery-current setting')
     watts = settings.get('power_max_w')
     if watts is not None and (isinstance(watts, bool) or not isinstance(watts, (int, float))
                               or not math.isfinite(watts) or watts <= 0):
         raise ValueError('power_max_w must be a positive finite number')
-    return watts
+    amps = settings.get('dual_current_a', 150)
+    if (isinstance(amps, bool) or not isinstance(amps, (int, float))
+            or not math.isfinite(amps) or not 80 <= amps <= 150):
+        raise ValueError('dual_current_a must be between 80 and 150 A')
+    return watts, amps
 
 
 def query_limits(transport, connection, expression, deadline):
@@ -85,7 +87,7 @@ def matches(limits, amps, watts):
     return abs(limits[0] - amps) < 0.1 and (watts is None or abs(limits[1] - watts) < 0.1)
 
 
-def reconcile(transport, watts=None, duration=WAIT_SECONDS):
+def reconcile(transport, watts=None, duration=WAIT_SECONDS, dual_amps=150):
     deadline = time.monotonic() + duration
     connection = None
     attempt = 0
@@ -106,7 +108,7 @@ def reconcile(transport, watts=None, duration=WAIT_SECONDS):
                 if state[0] != 'on':
                     report('skipped: engine power turned off')
                     return
-                amps = target_current(state)
+                amps = target_current(state, dual_amps)
                 if not matches(limits, amps, watts):
                     expression = "(progn (conf-set 'l-in-current-max %s) " % float(amps)
                     if watts is not None:
@@ -118,7 +120,7 @@ def reconcile(transport, watts=None, duration=WAIT_SECONDS):
                 if after[0] != 'on':
                     report('skipped: engine power turned off after readback')
                     return
-                if target_current(after) != amps:
+                if target_current(after, dual_amps) != amps:
                     report('battery state changed; reconciling again')
                     continue
                 report('verified: battery=%gA power=%gW packs=%s/%s sender=%d attempt=%d'
@@ -136,7 +138,7 @@ def reconcile(transport, watts=None, duration=WAIT_SECONDS):
 
 def main():
     syslog.openlog('tunu-battery-current', syslog.LOG_PID, syslog.LOG_DAEMON)
-    watts = load_power_limit(Path(__file__).with_suffix('.json'))
+    watts, dual_amps = load_limits(Path(__file__).with_suffix('.json'))
     with open('/run/lock/tunu-battery-current.lock', 'a') as lock:
         deadline = time.monotonic() + WAIT_SECONDS
         while True:
@@ -147,7 +149,8 @@ def main():
                 if time.monotonic() >= deadline:
                     raise RuntimeError('battery-current reconciliation lock timed out')
                 time.sleep(0.1)
-        reconcile(load_transport(), watts, duration=max(0.0, deadline - time.monotonic()))
+        reconcile(load_transport(), watts, duration=max(0.0, deadline - time.monotonic()),
+                  dual_amps=dual_amps)
 
 
 if __name__ == '__main__':

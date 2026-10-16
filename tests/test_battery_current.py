@@ -118,6 +118,20 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(self.transport.VescCan.call_count, 2)
         self.assertEqual(self.clock[0], 1)
 
+    def test_configured_dual_current_and_power(self):
+        self.transport.cmd_repl.side_effect = [reply(150, 5500), reply(120, 7000)]
+        policy.reconcile(self.transport, 7000, dual_amps=120)
+        self.assertIn("(conf-set 'l-in-current-max 120.0)", self.expressions()[-1])
+        self.assertIn("(conf-set 'l-watt-max 7000.0)", self.expressions()[-1])
+        self.assertEqual(policy.target_current(SINGLE, 120), 80)
+
+    def test_configured_limit_survives_pack_change(self):
+        self.state.side_effect = [DUAL, DUAL, SINGLE, SINGLE, SINGLE, SINGLE]
+        self.transport.cmd_repl.side_effect = [reply(150), reply(120), reply(120), reply(80)]
+        policy.reconcile(self.transport, dual_amps=120)
+        self.assertIn("(conf-set 'l-in-current-max 120.0)", self.expressions()[1])
+        self.assertIn("(conf-set 'l-in-current-max 80.0)", self.expressions()[3])
+
     def test_power_only_change_is_applied(self):
         self.transport.cmd_repl.side_effect = [reply(150, 5000), reply()]
         policy.reconcile(self.transport, 8000)
@@ -128,17 +142,25 @@ class ConfigTests(unittest.TestCase):
     def test_optional_power_configuration(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'limits.json'
-            self.assertIsNone(policy.load_power_limit(path))
+            self.assertEqual(policy.load_limits(path), (None, 150))
             for value in (None, 8000):
                 path.write_text(json.dumps({'power_max_w': value}))
-                self.assertEqual(policy.load_power_limit(path), value)
+                self.assertEqual(policy.load_limits(path), (value, 150))
             for value in (True, '8000', 0, -1, float('inf'), float('nan')):
                 path.write_text(json.dumps({'power_max_w': value}))
                 with self.assertRaises(ValueError):
-                    policy.load_power_limit(path)
-            path.write_text('{"power_typo": 8000}')
-            with self.assertRaises(ValueError):
-                policy.load_power_limit(path)
+                    policy.load_limits(path)
+            for value in (80, 120, 150):
+                path.write_text(json.dumps({'power_max_w': 7000, 'dual_current_a': value}))
+                self.assertEqual(policy.load_limits(path), (7000, value))
+            for value in (None, True, '120', 79, 151, float('nan')):
+                path.write_text(json.dumps({'dual_current_a': value}))
+                with self.assertRaises(ValueError):
+                    policy.load_limits(path)
+            for text in ('{"power_typo": 8000}', '[]', 'null'):
+                path.write_text(text)
+                with self.assertRaises(ValueError):
+                    policy.load_limits(path)
 
 
 if __name__ == '__main__':
