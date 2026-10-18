@@ -42,6 +42,18 @@ class PrivateBuilderTests(unittest.TestCase):
         self.assertIn("(var generation (advance-music-generation))",
                       builder.PRIVATE_FUNCTIONS["play-axelf"])
 
+    def test_reusable_tools_have_no_machine_specific_paths(self):
+        for path in (ROOT / "tools/warp-sound/build_private.py",
+                     ROOT / "tools/warp-sound/convert_audio.py",
+                     ROOT / "tools/warp-sound/README.md"):
+            text = path.read_text()
+            self.assertNotIn("/home/", text)
+            self.assertNotIn(".local/state", text)
+
+    def test_private_input_and_output_paths_cannot_target_repository(self):
+        with self.assertRaisesRegex(ValueError, "outside the repository"):
+            builder.require_private_path(ROOT / "private-media.s8", "sample")
+
     def test_function_replacement_skips_comments_and_parentheses_in_strings(self):
         source = '(defun target () { (print "(ignored)") ; ) ignored\n true })\n(defun other () nil)'
         changed = builder.replace_defun(source, "target", "(defun target () false)")

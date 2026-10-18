@@ -251,11 +251,18 @@ def injected_app(source):
     return source
 
 
-def load_flash_module():
-    spec = importlib.util.spec_from_file_location("tunu_flash", REPO / "tunu-flash.py")
+def load_module(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def require_private_path(path, label):
+    path = Path(path).resolve()
+    if path == REPO or REPO in path.parents:
+        raise ValueError(label + " must stay outside the repository")
+    return path
 
 
 def stock_resource_overrides(backup):
@@ -302,8 +309,10 @@ def build_image(flash, source, base_dir, stock_overrides, samples=None):
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--sample", type=Path, required=True, help="private signed 8-bit sample")
-    parser.add_argument("--sample-sha256", required=True, help="expected sample-stream SHA256")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--source-audio", type=Path, help="private audio file converted with ffmpeg")
+    source.add_argument("--sample-stream", type=Path, help="private signed 8-bit 16 kHz stream")
+    parser.add_argument("--sample-sha256", help="expected converted sample-stream SHA256")
     parser.add_argument("--resource-backup", type=Path, required=True,
                         help="directory with installed-imports.json and preserved package resources")
     parser.add_argument("--base-catalog", type=Path, required=True,
@@ -315,12 +324,13 @@ def parse_args():
 
 def main():
     args = parse_args()
-    sample = args.sample.read_bytes()
-    if len(sample) != SAMPLE_BYTES or hashlib.sha256(sample).hexdigest() != args.sample_sha256:
-        raise ValueError("sample does not match the expected signed 16 kHz mono stream")
-    output = args.output_dir.resolve()
-    if output == REPO or REPO in output.parents:
-        raise ValueError("private generated bundle must be outside the repository")
+    output = require_private_path(args.output_dir, "private generated bundle")
+    if args.resource_backup:
+        args.resource_backup = require_private_path(args.resource_backup, "captured VESC resources")
+    if args.source_audio:
+        args.source_audio = require_private_path(args.source_audio, "source audio")
+    if args.sample_stream:
+        args.sample_stream = require_private_path(args.sample_stream, "sample stream")
     base_catalog = json.loads(args.base_catalog.read_text())
     if not isinstance(base_catalog, list) or any(not isinstance(item, dict) for item in base_catalog):
         raise ValueError("base catalogue must be an array of song objects")
@@ -331,6 +341,19 @@ def main():
         raise ValueError("song name already exists in the base catalogue")
 
     output.mkdir(parents=True, exist_ok=True)
+    if args.source_audio:
+        converter = load_module(Path(__file__).with_name("convert_audio.py"), "warp_convert_audio")
+        sample_path = output / "warp-sound-16000.s8"
+        converter.convert_audio(args.source_audio, sample_path, args.sample_sha256)
+        sample = sample_path.read_bytes()
+    else:
+        sample = args.sample_stream.read_bytes()
+    if len(sample) != SAMPLE_BYTES:
+        raise ValueError("sample must contain exactly %d signed 16 kHz mono samples" % SAMPLE_BYTES)
+    sample_digest = hashlib.sha256(sample).hexdigest()
+    if args.sample_sha256 and sample_digest != args.sample_sha256:
+        raise ValueError("sample stream SHA256 does not match the expected digest")
+
     sample_dir = output / "bundle/vesc/samples"
     sample_dir.mkdir(parents=True, exist_ok=True)
     chunks = []
@@ -357,7 +380,7 @@ def main():
     if "samples/warp-sample-" in default_source or "@private-warp-dispatch" not in default_source:
         raise ValueError("generic application unexpectedly depends on private sample assets")
 
-    flash = load_flash_module()
+    flash = load_module(REPO / "tunu-flash.py", "tunu_flash")
     stock = stock_resource_overrides(args.resource_backup.resolve())
     default_image = build_image(flash, default_source.encode(), REPO, stock)
     private_source = injected_app(default_source)
@@ -384,6 +407,7 @@ def main():
     print("staged sample song %d; preserved %d existing catalogue entries" %
           (SONG_ID, len(catalog) - 1))
     print("private image: %s sha256=%s" % (image_path, hashlib.sha256(image).hexdigest()))
+    print("sample stream sha256=%s" % sample_digest)
     print("preview: %s" % preview)
 
 
