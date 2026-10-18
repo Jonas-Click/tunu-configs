@@ -10,9 +10,12 @@ policy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(policy)
 
 
-def event(before, after):
-    return {"from": before, "to": after,
-            "data": {"hash": "engine-ecu", "field": "speed"}}
+def event(before, after, timestamp=None):
+    result = {"from": before, "to": after,
+              "data": {"hash": "engine-ecu", "field": "speed"}}
+    if timestamp is not None:
+        result["ts"] = timestamp
+    return result
 
 
 class WarpSoundPolicyTests(unittest.TestCase):
@@ -23,6 +26,7 @@ class WarpSoundPolicyTests(unittest.TestCase):
         rule = rules[0]
         self.assertFalse(rule["enabled"])
         self.assertEqual(rule["on"], ["input.warp-speed"])
+        self.assertEqual(rule["concurrency"], "drop")
         self.assertEqual(rule["input"][0]["hash"], "engine-ecu")
         self.assertEqual(rule["input"][0]["fields"], ["speed"])
         self.assertEqual(rule["input"][1]["hash"], "vehicle")
@@ -32,6 +36,7 @@ class WarpSoundPolicyTests(unittest.TestCase):
         self.armed = {"armed": True, "last_trigger": 0.0}
 
     def evaluate(self, ev, current, state="ready-to-drive", saved=None, now=100.0):
+        ev.setdefault("ts", now * 1000)
         return policy.decide(ev, current, state, self.armed if saved is None else saved, now)
 
     def test_upward_crossing_plays_once(self):
@@ -66,6 +71,16 @@ class WarpSoundPolicyTests(unittest.TestCase):
         saved, play = self.evaluate(event("51", "44"), "53", saved={"armed": False})
         self.assertFalse(play)
         self.assertFalse(saved["armed"])
+
+    def test_old_or_missing_event_timestamp_is_rejected(self):
+        for timestamp in (97000, 100251):
+            rejected, play = self.evaluate(event("50", "51", timestamp), "51", now=100)
+            self.assertFalse(play)
+            self.assertTrue(rejected["armed"])
+        missing, play = policy.decide(event("50", "51"), "51", "ready-to-drive",
+                                      self.armed, 100)
+        self.assertFalse(play)
+        self.assertTrue(missing["armed"])
 
     def test_cooldown_suppresses_crossing_until_rearmed_and_expired(self):
         saved = {"armed": True, "last_trigger": 90.0}

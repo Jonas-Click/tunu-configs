@@ -2,7 +2,7 @@
 name = "tunu-warp-sound"
 enabled = false
 on = ["input.warp-speed"]
-concurrency = "queue"
+concurrency = "drop"
 
   [[rule.input]]
   hash = "engine-ecu"

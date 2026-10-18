@@ -9,6 +9,8 @@ import time
 THRESHOLD_KMH = 50.0
 REARM_KMH = 45.0
 COOLDOWN_SECONDS = 45.0
+MAX_EVENT_AGE_SECONDS = 1.0
+MAX_FUTURE_SKEW_SECONDS = 0.25
 SONG_NUMBER = 7
 STATE_KEY = "tunu:warp-sound:trigger-state"
 
@@ -27,6 +29,12 @@ def decide(event, current_speed, vehicle_state, saved, now):
     """Return (next state, should publish); event values are observed strings."""
     data = event.get("data")
     if not isinstance(data, dict) or data.get("hash") != "engine-ecu" or data.get("field") != "speed":
+        return saved, False
+    timestamp = number(event.get("ts"))
+    if timestamp is None:
+        return saved, False
+    age = now - timestamp / 1000.0
+    if age < -MAX_FUTURE_SKEW_SECONDS or age > MAX_EVENT_AGE_SECONDS:
         return saved, False
     before = number(event.get("from"))
     after = number(event.get("to"))

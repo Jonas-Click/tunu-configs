@@ -1,15 +1,17 @@
 ; ===== MIDI imports — must appear before any executable code =====
 (import "pkg::midi@://vesc_packages/lib_midi/midi.vescpkg" 'midi)
 
-; Axel F is imported from vesc_tool's built-in stock lib_files package (works
-; because vesc_tool resolves :// imports from its OWN resources). It's the
-; one song kept special-cased: every OTHER song arrives over CAN from
-; music-service immediately before it plays, so app.lisp holds no embedded
-; melody content at all — Axel F is a package reference resolved by
-; vesc_tool itself, so there's nothing to stream for it. No custom package
-; needs to be installed on the device.
+; Axel F is imported from vesc_tool's built-in stock lib_files package.
+; The private warp-sound recording is imported as signed 8-bit sample chunks,
+; kept in this app image so the playback command sends no audio over CAN.
 (import "pkg::midi_axelf_melody@://vesc_packages/lib_files/files.vescpkg" 'song1-track0)
 (import "pkg::midi_axelf_base@://vesc_packages/lib_files/files.vescpkg"   'song1-track1)
+(import "samples/warp-sample-0.s8" 'warp-sample-0)
+(import "samples/warp-sample-1.s8" 'warp-sample-1)
+(import "samples/warp-sample-2.s8" 'warp-sample-2)
+(import "samples/warp-sample-3.s8" 'warp-sample-3)
+(import "samples/warp-sample-4.s8" 'warp-sample-4)
+(import "samples/warp-sample-5.s8" 'warp-sample-5)
 
 (def can-cnt 0)
 (def statusByte_1 0x00)
@@ -106,6 +108,9 @@
 ; Axel F's reserved song number — must match songs.json's "number" for the
 ; "Axel F" / "source": "builtin-package" entry on the music-service side.
 (def axelf-song-number 1)
+(def warp-song-number 7)
+(def warp-sample-rate 16000.0)
+(def warp-sample-voltage 0.15)
 
 ; ===== Music control CAN IDs =====
 ; All in the 0x4E0-0x4EF range that the VESC firmware filter passes through
@@ -364,12 +369,53 @@
     (def music-playing false)
 })
 
+(defun play-warp-samples-track (song-id) {
+    (foc-play-samples warp-sample-0 warp-sample-rate (* warp-sample-voltage music-master-vol))
+    (sleep 0.500125)
+    (if (= current-song song-id) {
+        (foc-play-samples warp-sample-1 warp-sample-rate (* warp-sample-voltage music-master-vol))
+        (sleep 0.500125)
+    })
+    (if (= current-song song-id) {
+        (foc-play-samples warp-sample-2 warp-sample-rate (* warp-sample-voltage music-master-vol))
+        (sleep 0.500125)
+    })
+    (if (= current-song song-id) {
+        (foc-play-samples warp-sample-3 warp-sample-rate (* warp-sample-voltage music-master-vol))
+        (sleep 0.500125)
+    })
+    (if (= current-song song-id) {
+        (foc-play-samples warp-sample-4 warp-sample-rate (* warp-sample-voltage music-master-vol))
+        (sleep 0.500125)
+    })
+    (if (= current-song song-id) {
+        (foc-play-samples warp-sample-5 warp-sample-rate (* warp-sample-voltage music-master-vol))
+        (sleep 0.25975)
+    })
+    (if (= current-song song-id) {
+        (stop-music)
+        (send-music-status)
+    })
+})
+
+(defun play-warp-samples () {
+    (def current-song 0)
+    (sleep 0.05)
+    (foc-play-stop)
+    (loopforeach ch channels { (setix ch 1 0) })
+    (def music-t-start (systime))
+    (def current-song warp-song-number)
+    (spawn 200 play-warp-samples-track warp-song-number)
+    (def music-playing true)
+})
+
 ; Plays whatever's currently loaded in song-buf-0/1, according to which track
 ; slots handle-upload-end has marked ready.
 (defun play-current-song () {
     (def current-song 0)        ; stop any running tracks
     (sleep 0.05)                ; wait before re-opening parsers
     (if (or song-buf-0-ready song-buf-1-ready) {
+        (foc-play-stop)
         (if song-buf-0-ready (ext-midi-open 0 song-buf-0))
         (if song-buf-1-ready (ext-midi-open 1 song-buf-1))
         ; Set timing reference after parsers are loaded — avoids startup delay
@@ -388,6 +434,7 @@
 (defun play-axelf () {
     (def current-song 0)
     (sleep 0.05)
+    (foc-play-stop)
     (ext-midi-open 0 song1-track0)
     (ext-midi-open 1 song1-track1)
     (def music-t-start (systime))
@@ -498,6 +545,7 @@
         (cond
             ((= cmd 0x00) (stop-music))
             ((= cmd axelf-song-number) (play-axelf))
+            ((= cmd warp-song-number) (play-warp-samples))
             ((= cmd resident-song-number) (play-current-song))
             (t (print (list "Music cmd" cmd "ignored: no matching resident song"))))
         (send-music-status)

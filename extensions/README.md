@@ -1,8 +1,10 @@
 # Warp-sound trigger prototype
 
-`warp-sound.toml` is deliberately disabled. It observes the existing `engine-ecu.speed` and `vehicle.state` fields; `warp-sound.py` checks for an upward observed crossing above 50 km/h, requires `ready-to-drive`, rearms below 45 km/h, and enforces a 45-second cooldown. Playback is requested through the music-service Redis channel, not CAN. Its latch is stored under `tunu:warp-sound:trigger-state`, outside vehicle hashes.
+`warp-sound.toml` is deliberately disabled. It observes `engine-ecu.speed`; `warp-sound.py` accepts only an upward `<=50` to `>50 km/h` event while current speed matches and `vehicle.state` is `ready-to-drive`. It rejects missing or older-than-one-second event timestamps, drops concurrent events rather than queuing them, rearms below 45 km/h, and enforces a 45-second cooldown. Playback uses the existing music-service Redis channel, and its latch is stored under `tunu:warp-sound:trigger-state`, outside vehicle hashes.
 
-Do not enable this rule for vehicle use yet. The current fields and event service do not establish telemetry age, complete transition delivery across reconnect/startup, or safe operation of `foc-play-tone` on the installed VESC firmware while driving. An event's `from`/`to` values are observations and may coalesce changes; checking the current speed only rejects mismatched queued events, not every stale event. The local-only MIDI and WAV approximation are staged outside this repository and are not distributed here.
+The VESC app uses the documented `foc-play-samples` byte-array API with resident, signed 8-bit sample chunks. The sample arrays are embedded with the app image, so the speed trigger sends only the existing song-number command, not a PCM upload. The exact waveform and staged bundle remain private and are not distributed here.
+
+Keep the event rule disabled until a reconnect continuity guarantee is available: event timestamps are assigned when event-service emits the observation, not when the ECU measured speed, and the current watcher does not reseed its shadow on Redis reconnect. A reconnect can therefore create an apparently fresh crossing from a stale `from` value. This extension cannot detect that boundary itself.
 
 Offline tests:
 
