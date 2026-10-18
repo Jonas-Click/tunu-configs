@@ -12,7 +12,7 @@ The repository contains reusable conversion and opt-in build tools, not a record
 
 ## Reproduce a private build
 
-Choose private paths for the audio file, resource backups, base catalogue, and output directory. The output directory must be outside this repository. Record `ffmpeg -version` alongside build results when exact reproduction matters.
+Choose private paths for the audio file, resource backups, base catalogue, and output directory. The output directory must be outside this repository. A newly created output directory is restricted to mode `0700`; an existing directory with group/other access is rejected without changing it. Record `ffmpeg -version` alongside build results when exact reproduction matters.
 
 Convert a supplied audio file to raw signed 8-bit, mono, 16 kHz PCM:
 

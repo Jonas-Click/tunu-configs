@@ -265,6 +265,29 @@ def require_private_path(path, label):
     return path
 
 
+def prepare_private_output(path):
+    output = require_private_path(path, "private generated bundle")
+    if output.exists():
+        if not output.is_dir():
+            raise ValueError("private output path must be a directory")
+        if output.stat().st_mode & 0o077:
+            raise ValueError(
+                "existing private output directory must not be accessible by group or others")
+        return output
+
+    missing = []
+    parent = output
+    while not parent.exists():
+        missing.append(parent)
+        parent = parent.parent
+    if not parent.is_dir():
+        raise ValueError("private output parent must be a directory")
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700)
+        directory.chmod(0o700)
+    return output
+
+
 def stock_resource_overrides(backup):
     metadata = json.loads((backup / "installed-imports.json").read_text())
     by_tag = {item["tag"]: item for item in metadata}
@@ -324,7 +347,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    output = require_private_path(args.output_dir, "private generated bundle")
+    output = prepare_private_output(args.output_dir)
     if args.resource_backup:
         args.resource_backup = require_private_path(args.resource_backup, "captured VESC resources")
     if args.source_audio:
@@ -340,7 +363,6 @@ def main():
     if ENTRY["name"] in [item.get("name") for item in base_catalog]:
         raise ValueError("song name already exists in the base catalogue")
 
-    output.mkdir(parents=True, exist_ok=True)
     if args.source_audio:
         converter = load_module(Path(__file__).with_name("convert_audio.py"), "warp_convert_audio")
         sample_path = output / "warp-sound-16000.s8"

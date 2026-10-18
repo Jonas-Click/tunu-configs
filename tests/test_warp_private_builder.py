@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Test private-build injection without private media or VESC resources."""
 import importlib.util
+import os
 from pathlib import Path
 import re
+import stat
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +52,27 @@ class PrivateBuilderTests(unittest.TestCase):
             text = path.read_text()
             self.assertNotIn("/home/", text)
             self.assertNotIn(".local/state", text)
+
+    def test_new_output_directory_is_private_even_with_permissive_umask(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "private" / "nested" / "output"
+            previous = os.umask(0)
+            try:
+                result = builder.prepare_private_output(output)
+            finally:
+                os.umask(previous)
+            self.assertEqual(result, output.resolve())
+            for directory in (output.parent.parent, output.parent, output):
+                self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o700)
+
+    def test_existing_output_with_group_access_is_rejected_not_changed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "existing-output"
+            output.mkdir(mode=0o755)
+            output.chmod(0o755)
+            with self.assertRaisesRegex(ValueError, "accessible by group or others"):
+                builder.prepare_private_output(output)
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o755)
 
     def test_private_input_and_output_paths_cannot_target_repository(self):
         with self.assertRaisesRegex(ValueError, "outside the repository"):
