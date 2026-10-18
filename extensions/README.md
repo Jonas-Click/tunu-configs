@@ -1,3 +1,15 @@
+# Warp-sound trigger prototype
+
+`warp-sound.toml` is deliberately disabled. It observes the existing `engine-ecu.speed` and `vehicle.state` fields; `warp-sound.py` checks for an upward observed crossing above 50 km/h, requires `ready-to-drive`, rearms below 45 km/h, and enforces a 45-second cooldown. Playback is requested through the music-service Redis channel, not CAN. Its latch is stored under `tunu:warp-sound:trigger-state`, outside vehicle hashes.
+
+Do not enable this rule for vehicle use yet. The current fields and event service do not establish telemetry age, complete transition delivery across reconnect/startup, or safe operation of `foc-play-tone` on the installed VESC firmware while driving. An event's `from`/`to` values are observations and may coalesce changes; checking the current speed only rejects mismatched queued events, not every stale event. The local-only MIDI and WAV approximation are staged outside this repository and are not distributed here.
+
+Offline tests:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_warp_sound.py' -v
+```
+
 # Battery-current events
 
 These rules reconcile TUNU runtime limits when engine power turns on or a battery is inserted, removed or changes state. They require Librescoot event-service and Python 3 on the MDB.
