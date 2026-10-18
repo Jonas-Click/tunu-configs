@@ -23,7 +23,7 @@ def convert_audio(source, destination, expected_sha256=None, ffmpeg="ffmpeg"):
     executable = shutil.which(ffmpeg)
     if executable is None:
         raise FileNotFoundError("ffmpeg executable not found: " + ffmpeg)
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     fd, temporary_name = tempfile.mkstemp(
         prefix="." + destination.name + ".", suffix=".s8", dir=destination.parent)
     os.close(fd)

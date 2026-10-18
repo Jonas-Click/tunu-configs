@@ -2,6 +2,7 @@
 """Test deterministic signed-8 audio conversion without bundled media."""
 import hashlib
 import importlib.util
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -40,6 +41,16 @@ class AudioConverterTests(unittest.TestCase):
         self.assertEqual(self.command[self.command.index("-f") + 1], "s8")
         self.assertEqual(self.command[self.command.index("-ac") + 1], "1")
         self.assertEqual(self.command[self.command.index("-ar") + 1], "16000")
+
+    @mock.patch.object(converter.shutil, "which", return_value="/fake/ffmpeg")
+    def test_new_output_directory_is_compatible_with_private_builder(self, _which):
+        previous = os.umask(0)
+        try:
+            with mock.patch.object(converter.subprocess, "run", side_effect=self.fake_ffmpeg):
+                converter.convert_audio(self.source, self.output)
+        finally:
+            os.umask(previous)
+        self.assertEqual(self.output.parent.stat().st_mode & 0o777, 0o700)
 
     @mock.patch.object(converter.shutil, "which", return_value="/fake/ffmpeg")
     def test_failed_validation_preserves_existing_output_and_removes_temporary_file(self, _which):
