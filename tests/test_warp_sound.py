@@ -10,12 +10,9 @@ policy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(policy)
 
 
-def event(before, after, timestamp=None):
-    result = {"from": before, "to": after,
-              "data": {"hash": "engine-ecu", "field": "speed"}}
-    if timestamp is not None:
-        result["ts"] = timestamp
-    return result
+def event(before, after, timestamp):
+    return {"from": before, "to": after, "ts": timestamp,
+            "data": {"hash": "engine-ecu", "field": "speed"}}
 
 
 class WarpSoundPolicyTests(unittest.TestCase):
@@ -33,71 +30,97 @@ class WarpSoundPolicyTests(unittest.TestCase):
         self.assertEqual(rule["input"][1]["fields"], ["state"])
 
     def setUp(self):
-        self.armed = {"armed": True, "last_trigger": 0.0}
+        self.saved = {"armed": False, "last_trigger": 0.0}
 
-    def evaluate(self, ev, current, state="ready-to-drive", saved=None, now=100.0):
-        ev.setdefault("ts", now * 1000)
-        return policy.decide(ev, current, state, self.armed if saved is None else saved, now)
+    def evaluate(self, ev, current=None, state="ready-to-drive", saved=None, now=None):
+        timestamp = ev["ts"] / 1000.0
+        return policy.decide(ev, str(ev["to"] if current is None else current), state,
+                             self.saved if saved is None else saved,
+                             timestamp if now is None else now)
 
-    def test_upward_crossing_plays_once(self):
-        saved, play = self.evaluate(event("50", "50.1"), "50.1")
+    def seed_below_rearm(self, timestamp=100000):
+        return self.evaluate(event("44", "44", timestamp), "44")[0]
+
+    def test_recent_contiguous_upward_crossing_plays_once(self):
+        saved = self.seed_below_rearm()
+        saved, play = self.evaluate(event("44", "50", 100200), saved=saved)
+        self.assertFalse(play)
+        saved, play = self.evaluate(event("50", "50.1", 100400), saved=saved)
         self.assertTrue(play)
         self.assertFalse(saved["armed"])
-        saved, play = self.evaluate(event("51", "52"), "52", saved=saved, now=110)
+        saved, play = self.evaluate(event("50.1", "52", 100600), saved=saved)
         self.assertFalse(play)
 
-    def test_downward_crossing_does_not_play_and_rearms_below_45(self):
-        saved, play = self.evaluate(event("51", "50"), "50")
+    def test_first_event_and_mismatched_predecessor_cannot_trigger(self):
+        saved, play = self.evaluate(event("50", "51", 100000), "51")
         self.assertFalse(play)
-        saved, play = self.evaluate(event("46", "45"), "45", saved={"armed": False})
+        saved = self.seed_below_rearm()
+        saved, play = self.evaluate(event("49", "51", 100200), saved=saved)
+        self.assertFalse(play)
+        self.assertFalse(saved["armed"])
+        self.assertIsNone(saved["baseline_speed"])
+
+    def test_old_future_out_of_order_and_gap_events_invalidate_baseline(self):
+        for first, second, now in (
+            (100000, 102000, 1020.0),       # predecessor gap exceeds one second
+            (100000, 99999, 100.0),         # timestamp goes backwards
+            (97000, 100000, 100.0),         # old observation clears baseline
+            (100251, 100000, 100.0),        # future timestamp clears baseline
+        ):
+            with self.subTest(first=first, second=second):
+                saved = self.seed_below_rearm(first)
+                rejected, play = self.evaluate(event("44", "51", second), "51",
+                                               saved=saved, now=now)
+                self.assertFalse(play)
+                self.assertFalse(rejected["armed"])
+                self.assertIsNone(rejected["baseline_speed"])
+                self.assertIsNone(rejected["baseline_ts_ms"])
+
+    def test_missing_or_invalid_fields_and_speed_mismatch_invalidate(self):
+        saved = self.seed_below_rearm()
+        for ev, current in (
+            ({"from": "44", "to": "51", "ts": 100100,
+              "data": {"hash": "engine-ecu", "field": "speed"}}, "NaN"),
+            ({"from": "44", "to": "NaN", "ts": 100100,
+              "data": {"hash": "engine-ecu", "field": "speed"}}, "NaN"),
+            ({"from": "44", "to": "51",
+              "data": {"hash": "engine-ecu", "field": "speed"}}, "51"),
+        ):
+            rejected, play = policy.decide(ev, current, "ready-to-drive", saved, 100.1)
+            self.assertFalse(play)
+            self.assertFalse(rejected["armed"])
+            self.assertIsNone(rejected["baseline_speed"])
+
+    def test_stale_event_cannot_rearm(self):
+        saved = {"armed": False, "last_trigger": 0, "baseline_speed": 60,
+                 "baseline_ts_ms": 99000}
+        updated, play = self.evaluate(event("60", "44", 97000), "44",
+                                      saved=saved, now=100)
+        self.assertFalse(play)
+        self.assertFalse(updated["armed"])
+        self.assertIsNone(updated["baseline_speed"])
+
+    def test_downward_observation_rearms_and_cooldown_is_preserved(self):
+        saved = {"armed": False, "last_trigger": 90.0,
+                 "baseline_speed": 51.0, "baseline_ts_ms": 100000}
+        saved, play = self.evaluate(event("51", "44", 100100), saved=saved)
         self.assertFalse(play)
         self.assertTrue(saved["armed"])
-
-    def test_startup_above_threshold_and_unknown_from_do_not_play(self):
-        for before in ("", "55"):
-            saved, play = self.evaluate(event(before, "56"), "56")
-            self.assertFalse(play)
-            self.assertFalse(saved["armed"])
+        saved["last_trigger"] = 100.0
+        saved, play = self.evaluate(event("44", "51", 100200), saved=saved, now=100.2)
+        self.assertFalse(play)
+        self.assertFalse(saved["armed"])
 
     def test_non_driving_state_does_not_play(self):
-        saved, play = self.evaluate(event("50", "51"), "51", state="parked")
+        saved = self.seed_below_rearm()
+        saved, play = self.evaluate(event("44", "51", 100100), "51", state="parked", saved=saved)
         self.assertFalse(play)
         self.assertFalse(saved["armed"])
 
-    def test_stale_event_does_not_play_or_rearm(self):
-        saved, play = self.evaluate(event("50", "51"), "53")
-        self.assertFalse(play)
-        self.assertFalse(saved["armed"])
-        saved, play = self.evaluate(event("51", "44"), "53", saved={"armed": False})
-        self.assertFalse(play)
-        self.assertFalse(saved["armed"])
-
-    def test_old_or_missing_event_timestamp_is_rejected(self):
-        for timestamp in (97000, 100251):
-            rejected, play = self.evaluate(event("50", "51", timestamp), "51", now=100)
-            self.assertFalse(play)
-            self.assertTrue(rejected["armed"])
-        missing, play = policy.decide(event("50", "51"), "51", "ready-to-drive",
-                                      self.armed, 100)
-        self.assertFalse(play)
-        self.assertTrue(missing["armed"])
-
-    def test_cooldown_suppresses_crossing_until_rearmed_and_expired(self):
-        saved = {"armed": True, "last_trigger": 90.0}
-        state, play = self.evaluate(event("50", "51"), "51", saved=saved, now=100)
-        self.assertFalse(play)
-        self.assertFalse(state["armed"])
-        state, play = self.evaluate(event("44", "44"), "44", saved=state, now=140)
-        self.assertFalse(play)
-        self.assertTrue(state["armed"])
-        state, play = self.evaluate(event("50", "51"), "51", saved=state, now=140)
-        self.assertTrue(play)
-
-    def test_invalid_speed_and_unrelated_field_do_not_play(self):
-        self.assertFalse(self.evaluate(event("NaN", "51"), "51")[1])
-        other = event("50", "51")
-        other["data"]["field"] = "rpm"
-        self.assertFalse(self.evaluate(other, "51")[1])
+    def test_event_timestamps_are_observation_time_not_ecu_time(self):
+        self.assertEqual(policy.MAX_EVENT_AGE_SECONDS, 1.0)
+        self.assertEqual(policy.MAX_BASELINE_GAP_SECONDS, 1.0)
+        self.assertEqual(policy.MAX_FUTURE_SKEW_SECONDS, 0.25)
 
 
 if __name__ == "__main__":

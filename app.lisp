@@ -2,16 +2,10 @@
 (import "pkg::midi@://vesc_packages/lib_midi/midi.vescpkg" 'midi)
 
 ; Axel F is imported from vesc_tool's built-in stock lib_files package.
-; The private warp-sound recording is imported as signed 8-bit sample chunks,
-; kept in this app image so the playback command sends no audio over CAN.
 (import "pkg::midi_axelf_melody@://vesc_packages/lib_files/files.vescpkg" 'song1-track0)
 (import "pkg::midi_axelf_base@://vesc_packages/lib_files/files.vescpkg"   'song1-track1)
-(import "samples/warp-sample-0.s8" 'warp-sample-0)
-(import "samples/warp-sample-1.s8" 'warp-sample-1)
-(import "samples/warp-sample-2.s8" 'warp-sample-2)
-(import "samples/warp-sample-3.s8" 'warp-sample-3)
-(import "samples/warp-sample-4.s8" 'warp-sample-4)
-(import "samples/warp-sample-5.s8" 'warp-sample-5)
+; Private sample imports are added only to the generated sample-playback build.
+; @private-warp-imports
 
 (def can-cnt 0)
 (def statusByte_1 0x00)
@@ -108,9 +102,7 @@
 ; Axel F's reserved song number — must match songs.json's "number" for the
 ; "Axel F" / "source": "builtin-package" entry on the music-service side.
 (def axelf-song-number 1)
-(def warp-song-number 7)
-(def warp-sample-rate 16000.0)
-(def warp-sample-voltage 0.15)
+; @private-warp-config
 
 ; ===== Music control CAN IDs =====
 ; All in the 0x4E0-0x4EF range that the VESC firmware filter passes through
@@ -369,45 +361,7 @@
     (def music-playing false)
 })
 
-(defun play-warp-samples-track (song-id) {
-    (foc-play-samples warp-sample-0 warp-sample-rate (* warp-sample-voltage music-master-vol))
-    (sleep 0.500125)
-    (if (= current-song song-id) {
-        (foc-play-samples warp-sample-1 warp-sample-rate (* warp-sample-voltage music-master-vol))
-        (sleep 0.500125)
-    })
-    (if (= current-song song-id) {
-        (foc-play-samples warp-sample-2 warp-sample-rate (* warp-sample-voltage music-master-vol))
-        (sleep 0.500125)
-    })
-    (if (= current-song song-id) {
-        (foc-play-samples warp-sample-3 warp-sample-rate (* warp-sample-voltage music-master-vol))
-        (sleep 0.500125)
-    })
-    (if (= current-song song-id) {
-        (foc-play-samples warp-sample-4 warp-sample-rate (* warp-sample-voltage music-master-vol))
-        (sleep 0.500125)
-    })
-    (if (= current-song song-id) {
-        (foc-play-samples warp-sample-5 warp-sample-rate (* warp-sample-voltage music-master-vol))
-        (sleep 0.25975)
-    })
-    (if (= current-song song-id) {
-        (stop-music)
-        (send-music-status)
-    })
-})
-
-(defun play-warp-samples () {
-    (def current-song 0)
-    (sleep 0.05)
-    (foc-play-stop)
-    (loopforeach ch channels { (setix ch 1 0) })
-    (def music-t-start (systime))
-    (def current-song warp-song-number)
-    (spawn 200 play-warp-samples-track warp-song-number)
-    (def music-playing true)
-})
+; @private-warp-functions
 
 ; Plays whatever's currently loaded in song-buf-0/1, according to which track
 ; slots handle-upload-end has marked ready.
@@ -415,7 +369,6 @@
     (def current-song 0)        ; stop any running tracks
     (sleep 0.05)                ; wait before re-opening parsers
     (if (or song-buf-0-ready song-buf-1-ready) {
-        (foc-play-stop)
         (if song-buf-0-ready (ext-midi-open 0 song-buf-0))
         (if song-buf-1-ready (ext-midi-open 1 song-buf-1))
         ; Set timing reference after parsers are loaded — avoids startup delay
@@ -434,7 +387,6 @@
 (defun play-axelf () {
     (def current-song 0)
     (sleep 0.05)
-    (foc-play-stop)
     (ext-midi-open 0 song1-track0)
     (ext-midi-open 1 song1-track1)
     (def music-t-start (systime))
@@ -545,7 +497,7 @@
         (cond
             ((= cmd 0x00) (stop-music))
             ((= cmd axelf-song-number) (play-axelf))
-            ((= cmd warp-song-number) (play-warp-samples))
+            ; @private-warp-dispatch
             ((= cmd resident-song-number) (play-current-song))
             (t (print (list "Music cmd" cmd "ignored: no matching resident song"))))
         (send-music-status)
@@ -811,6 +763,7 @@
     (def song-buf-0 (array-create song-buf-max))  ; track slot 0: melody
     (def song-buf-1 (array-create song-buf-max))  ; track slot 1: bass
     (def channels (map (fn (x) (list x 0 0 0 0)) (range num-chan)))
+    ; @private-warp-init
 
     ; The VESC keeps its config while powered, so after a lisp restart the limits
     ; would hold stale values (e.g. a regen limit armed by a handshake that the
