@@ -6,6 +6,7 @@
 (import "pkg::midi_axelf_base@://vesc_packages/lib_files/files.vescpkg"   'song1-track1)
 ; Private sample imports are added only to the generated sample-playback build.
 ; @private-warp-imports
+; @boost-native-imports
 
 (def can-cnt 0)
 (def statusByte_1 0x00)
@@ -16,7 +17,7 @@
 (def motor-power-kw 0x03)
 (def max-speed-kmh 0x45)
 (def sw-base-version 0x10)  ; "1.0"
-(def sw-app-version 1)
+(def sw-app-version 2)
 
 (def pole-pairs 24.0)
 
@@ -79,6 +80,46 @@
 (def shutdown-threshold 2.48)
 (def shutdown-triggered false)
 
+; The optional native guard owns boost expiry independently of the Lisp evaluator.
+(def boost-native-enabled false)
+(def boost-policy-enabled false)
+(def boost-per-pack-amps 85.0)
+(def boost-duration-seconds 10.0)
+(def boost-cooldown-seconds 90.0)
+(def boost-heartbeat-ms 250)
+(def boost-supply-ms 3000)
+(def boost-release-ms 100)
+(def boost-runtime-ready false)
+(def boost-control-byte 1)
+
+(defun boost-start () {
+    (def boost-runtime-ready false)
+    (def boost-control-byte 1)
+    (if (and boost-native-enabled boost-policy-enabled)
+        (match (trap (progn
+            (load-native-lib boost-guard-lib)
+            (and (= (ext-boost-api) 1)
+                 (ext-boost-config boost-per-pack-amps boost-duration-seconds
+                                   boost-cooldown-seconds boost-heartbeat-ms boost-supply-ms boost-release-ms))))
+            ((exit-ok (? ready)) (def boost-runtime-ready ready))
+            (_ (print "Boost unavailable; normal limits retained"))))
+})
+
+(defun boost-tick () {
+    (if boost-runtime-ready
+        (if (not (ext-boost-heartbeat boost-control-byte (if (drive-requested) 1 0)))
+            (def boost-runtime-ready false)))
+})
+
+(defun boost-normal-current ()
+    (if boost-runtime-ready (ext-boost-normal-current) (conf-get 'l-in-current-max)))
+
+(defun boost-set-normal-current (amps packs)
+    (and boost-runtime-ready (ext-boost-normal amps packs)))
+
+(defun boost-supply-lease (packs normal-amps)
+    (and boost-runtime-ready (ext-boost-supply packs normal-amps)))
+
 ; ===== Music: streamed song buffers =====
 ; music-service streams a song's decoded MIDI bytes over CAN
 ; (Music_Upload_Begin/Chunk/End, below) immediately before playing it, into
@@ -132,6 +173,7 @@
 
 ; Build and send ECU_status4 (0x7E3) reflecting current KERS state
 (defun send-status4 (ebs-en gear-en) {
+    (if (and boost-runtime-ready (ext-boost-report)) nil {
     (var status-byte 0)
     (setq status-byte (bitwise-or status-byte 0x01))           ; ecu_is_enabled = 1
                                                                  ; ecu_is_disabled = 0 (bit 1)
@@ -147,6 +189,7 @@
     )
     (bufset-u8 dataArray_0x7E3 0 status-byte)
     (can-send-sid 0x7E3 dataArray_0x7E3)
+    })
 })
 
 ; Send ECU_ebs_get (0x7E5) echoing back current KERS parameters
@@ -529,6 +572,8 @@
         (var gear-en  (bitwise-and ctrl-byte 0x01))
         (var boost-en (shr (bitwise-and ctrl-byte 0x02) 1))
         (var ebs-en   (shr (bitwise-and ctrl-byte 0x04) 2))
+        (def boost-control-byte (bitwise-and ctrl-byte 7))
+        (boost-tick)
 
         (def kers-enabled (= ebs-en 1))
         (print (list "KERS:" kers-enabled "gear:" gear-en "boost:" boost-en))
@@ -786,6 +831,7 @@
 
     (load-native-lib midi)
     (ext-midi-init 2) ; 2 simultaneous MIDI parsers = max 2 tracks per song
+    (boost-start)
 
     ; Sustain envelope for the music engine
     (spawn 200 decay-loop)
@@ -822,6 +868,7 @@
     ; clear the fault.
     (loopwhile t {
         (check-shutdown)
+        (boost-tick)
         (update-kers-fade)
         (update-kers-current)
         (if (= (mod tick 40) 0) {

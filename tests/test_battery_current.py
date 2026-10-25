@@ -137,6 +137,31 @@ class ReconcileTests(unittest.TestCase):
         policy.reconcile(self.transport, 8000)
         self.assertIn("(conf-set 'l-watt-max 8000.0)", self.expressions()[-1])
 
+    def test_guarded_reconciliation_preserves_the_active_boost_allowance(self):
+        self.transport.cmd_repl.side_effect = [reply(120, 7500), reply(120, 7500)]
+        policy.reconcile(self.transport, 7500, dual_amps=120, boost_guard=True)
+        self.assertEqual(self.expressions()[0], policy.GUARDED_READBACK)
+        self.assertIn('(boost-set-normal-current 120.0 3)', self.expressions()[1])
+        self.assertNotIn("conf-set 'l-in-current-max", self.expressions()[1])
+
+    def test_guarded_missing_api_does_not_fall_back_to_direct_writes(self):
+        self.transport.cmd_repl.return_value = ['> variable_not_bound']
+        with self.assertRaises(RuntimeError):
+            policy.reconcile(self.transport, duration=1, boost_guard=True)
+        self.assertEqual(self.expressions(), [policy.GUARDED_READBACK])
+
+    def test_guarded_mode_revokes_pack_evidence_even_with_equal_normal_caps(self):
+        self.state.return_value = SINGLE
+        self.transport.cmd_repl.side_effect = [reply(60), reply(60)]
+        policy.reconcile(self.transport, single_amps=60, boost_guard=True)
+        self.assertIn('(boost-set-normal-current 60.0 1)', self.expressions()[1])
+
+    def test_single_current_can_preserve_a_sixty_amp_installation(self):
+        self.state.return_value = SINGLE
+        self.transport.cmd_repl.return_value = reply(60)
+        policy.reconcile(self.transport, single_amps=60)
+        self.assertEqual(self.expressions(), [policy.READBACK])
+
 
 class ConfigTests(unittest.TestCase):
     def test_optional_power_configuration(self):
@@ -157,6 +182,15 @@ class ConfigTests(unittest.TestCase):
                 path.write_text(json.dumps({'dual_current_a': value}))
                 with self.assertRaises(ValueError):
                     policy.load_limits(path)
+            path.write_text(json.dumps({'single_current_a': 60, 'boost_guard': True}))
+            self.assertEqual(policy.load_boost_policy(path), (None, 150, 60, True))
+            for value in (0, 86, True, '60', float('nan')):
+                path.write_text(json.dumps({'single_current_a': value}))
+                with self.assertRaises(ValueError):
+                    policy.load_limits(path)
+            path.write_text('{"boost_guard": 1}')
+            with self.assertRaises(ValueError):
+                policy.load_limits(path)
             for text in ('{"power_typo": 8000}', '[]', 'null'):
                 path.write_text(text)
                 with self.assertRaises(ValueError):

@@ -11,6 +11,16 @@ python3 tests/test_warp_samples.py
 python3 tests/test_warp_samples.py --source /path/to/private/bundle/vesc/app.lisp --repl /path/to/lispBM/repl/repl
 ```
 
+Timed boost tests run without hardware:
+
+```sh
+LBM_REPL=/path/to/lispBM/repl/repl PYTHONDONTWRITEBYTECODE=1 \
+  python3 -m unittest discover -s tests -p 'test_boost_*.py' -v
+python3 -m unittest discover -s tests -p 'test_battery_current.py' -v
+```
+
+The native adapter/core tests build with address and undefined-behavior sanitizers. They exercise independent heartbeat/supply expiry, qualified release, boot cooldown, duplicate commands, pack changes, external writes, unload and failed restoration. The Lisp tests evaluate the actual adapter with mocked VESC native extensions. Supply tests verify that initial/stale pack observations, absent native telemetry, boot delay and intervening power loss cannot create leases. Builder tests preserve target resources and leave the policy disabled unless explicitly requested. See [timed boost](../tools/boost/README.md) for ARM SDK builds and the controller status format.
+
 The TUNU 1.1 temperature test verifies that CAN status reports the firmware's measured FET temperature, including cold and overtemperature readings, while preserving the fault and reserved fields.
 
 The audio-converter test uses a mocked FFmpeg command and no media files. The private-builder test verifies that default app source has no private sample configuration or song-7 dispatch, then checks private injection points and function replacement. The default warp-sample test verifies private playback is disabled and song 7 remains available to streamed songs. The private-build test evaluates the generated sample player in LispBM with VESC calls stubbed; it exercises concurrent generation identity, two-buffer scheduling under bounded wake lateness, final-buffer completion, same-song replay, stop-before-first-chunk, switching to MIDI, and stop during a refill wait. Generate the private app with the offline bundle tool before running that second command.

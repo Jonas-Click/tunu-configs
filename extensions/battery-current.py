@@ -23,6 +23,7 @@ end
 return values
 """
 READBACK = '(print (list "TUNU-LIMITS" (conf-get \'l-in-current-max) (conf-get \'l-watt-max)))'
+GUARDED_READBACK = '(if boost-runtime-ready (print (list "TUNU-LIMITS" (boost-normal-current) (conf-get \'l-watt-max))) (print "BOOST_NOT_READY"))'
 NUMBER = r'([-+]?[0-9]+(?:\.[0-9]*)?(?:[eE][-+]?[0-9]+)?)(?:f32)?'
 RESULT = re.compile(r'\("TUNU-LIMITS"\s+' + NUMBER + r'\s+' + NUMBER + r'\)')
 
@@ -44,8 +45,13 @@ def read_state():
     return values
 
 
-def target_current(values, dual_amps=150):
-    return dual_amps if values[1:] == ['true', 'active', 'true', 'active'] else 80
+def target_current(values, dual_amps=150, single_amps=80):
+    return dual_amps if values[1:] == ['true', 'active', 'true', 'active'] else single_amps
+
+
+def active_mask(values):
+    return sum(1 << slot for slot in range(2)
+               if values[1 + slot * 2:3 + slot * 2] == ['true', 'active'])
 
 
 def load_transport():
@@ -56,9 +62,9 @@ def load_transport():
     return module
 
 
-def load_limits(path):
+def load_boost_policy(path):
     settings = json.loads(path.read_text()) if path.exists() else {}
-    if not isinstance(settings, dict) or set(settings) - {'power_max_w', 'dual_current_a'}:
+    if not isinstance(settings, dict) or set(settings) - {'power_max_w', 'dual_current_a', 'single_current_a', 'boost_guard'}:
         raise ValueError('unknown battery-current setting')
     watts = settings.get('power_max_w')
     if watts is not None and (isinstance(watts, bool) or not isinstance(watts, (int, float))
@@ -68,7 +74,17 @@ def load_limits(path):
     if (isinstance(amps, bool) or not isinstance(amps, (int, float))
             or not math.isfinite(amps) or not 80 <= amps <= 150):
         raise ValueError('dual_current_a must be between 80 and 150 A')
-    return watts, amps
+    single = settings.get('single_current_a', 80)
+    if (isinstance(single, bool) or not isinstance(single, (int, float))
+            or not math.isfinite(single) or not 1 <= single <= 85):
+        raise ValueError('single_current_a must be between 1 and 85 A')
+    if type(settings.get('boost_guard', False)) is not bool:
+        raise ValueError('boost_guard must be a boolean')
+    return watts, amps, single, settings.get('boost_guard', False)
+
+
+def load_limits(path):
+    return load_boost_policy(path)[:2]
 
 
 def query_limits(transport, connection, expression, deadline):
@@ -87,7 +103,9 @@ def matches(limits, amps, watts):
     return abs(limits[0] - amps) < 0.1 and (watts is None or abs(limits[1] - watts) < 0.1)
 
 
-def reconcile(transport, watts=None, duration=WAIT_SECONDS, dual_amps=150):
+def reconcile(transport, watts=None, duration=WAIT_SECONDS, dual_amps=150,
+              single_amps=80, boost_guard=False):
+    readback = GUARDED_READBACK if boost_guard else READBACK
     deadline = time.monotonic() + duration
     connection = None
     attempt = 0
@@ -103,24 +121,31 @@ def reconcile(transport, watts=None, duration=WAIT_SECONDS, dual_amps=150):
                 if connection is None:
                     connection = transport.VescCan('can0', 70, SENDER, 1.0)
                 # Probe Lisp readiness before changing limits; power-on precedes autostart.
-                limits = query_limits(transport, connection, READBACK, deadline)
+                limits = query_limits(transport, connection, readback, deadline)
                 state = read_state()
                 if state[0] != 'on':
                     report('skipped: engine power turned off')
                     return
-                amps = target_current(state, dual_amps)
-                if not matches(limits, amps, watts):
-                    expression = "(progn (conf-set 'l-in-current-max %s) " % float(amps)
+                amps = target_current(state, dual_amps, single_amps)
+                if boost_guard or not matches(limits, amps, watts):
+                    if boost_guard:
+                        expression = '(if (boost-set-normal-current %s %d) (progn ' % (float(amps), active_mask(state))
+                    else:
+                        expression = "(progn (conf-set 'l-in-current-max %s) " % float(amps)
                     if watts is not None:
                         expression += "(conf-set 'l-watt-max %s) " % float(watts)
-                    limits = query_limits(transport, connection, expression + READBACK + ')', deadline)
+                    expression += readback + ')'
+                    if boost_guard:
+                        expression += ' (print "BOOST_REJECTED"))'
+                    limits = query_limits(transport, connection, expression, deadline)
                     if not matches(limits, amps, watts):
                         raise RuntimeError('unexpected limit readback: ' + repr(limits))
                 after = read_state()
                 if after[0] != 'on':
                     report('skipped: engine power turned off after readback')
                     return
-                if target_current(after, dual_amps) != amps:
+                if (target_current(after, dual_amps, single_amps) != amps
+                        or (boost_guard and active_mask(after) != active_mask(state))):
                     report('battery state changed; reconciling again')
                     continue
                 report('verified: battery=%gA power=%gW packs=%s/%s sender=%d attempt=%d'
@@ -138,7 +163,7 @@ def reconcile(transport, watts=None, duration=WAIT_SECONDS, dual_amps=150):
 
 def main():
     syslog.openlog('tunu-battery-current', syslog.LOG_PID, syslog.LOG_DAEMON)
-    watts, dual_amps = load_limits(Path(__file__).with_suffix('.json'))
+    watts, dual_amps, single_amps, guarded = load_boost_policy(Path(__file__).with_suffix('.json'))
     with open('/run/lock/tunu-battery-current.lock', 'a') as lock:
         deadline = time.monotonic() + WAIT_SECONDS
         while True:
@@ -150,7 +175,7 @@ def main():
                     raise RuntimeError('battery-current reconciliation lock timed out')
                 time.sleep(0.1)
         reconcile(load_transport(), watts, duration=max(0.0, deadline - time.monotonic()),
-                  dual_amps=dual_amps)
+                  dual_amps=dual_amps, single_amps=single_amps, boost_guard=guarded)
 
 
 if __name__ == '__main__':

@@ -1,0 +1,15 @@
+[Unit]
+Description=TUNU boost supply observation lease
+After=valkey.service redis.service librescoot-battery.service
+ConditionPathExists=/data/extensions/boost-supply.py
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /data/extensions/boost-supply.py
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -12,6 +12,12 @@ Offline tests:
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_warp_sound.py' -v
 ```
 
+# Optional timed boost
+
+[Timed boost](../tools/boost/README.md) uses an independently expiring native current guard and a disabled-by-default Lisp policy. The common peak is 85 A per eligible pack, up to 170 A aggregate. Native motor configurations remain unchanged. The optional `boost-supply.py` service requires fresh controller telemetry and changed pack observations; it never powers the ECU or activates a battery.
+
+When enabling this feature, update `battery-current.py` and explicitly configure `boost_guard: true` so normal-current reconciliation goes through the guard instead of overwriting active boost. `single_current_a` can preserve an installation's normal single-pack limit; it defaults to the existing 80 A. The supply service is separate from event-service workers and must be installed/enabled explicitly with the matching controller app and ECU-service decoder.
+
 # Battery-current events
 
 These rules reconcile TUNU runtime limits when engine power turns on or a battery is inserted, removed or changes state. They require Librescoot event-service and Python 3 on the MDB.
