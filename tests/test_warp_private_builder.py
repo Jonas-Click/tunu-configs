@@ -38,8 +38,10 @@ class PrivateBuilderTests(unittest.TestCase):
         for name in builder.PRIVATE_FUNCTIONS:
             matches = re.findall(r"\(defun " + re.escape(name) + r"\b", source)
             self.assertEqual(len(matches), 1, name)
-        self.assertIn("(var generation (advance-music-generation))",
-                      builder.PRIVATE_FUNCTIONS["stop-music"])
+        self.assertIn("(advance-music-generation)", builder.PRIVATE_FUNCTIONS["stop-music"])
+        self.assertEqual(len(re.findall(r"^\(def music-play-generation 0\)$", source, re.M)), 1)
+        self.assertEqual(source.count("(defun advance-music-generation "), 1)
+        self.assertIn("(music-track-finished generation parser-idx)", source)
         self.assertIn("(var generation (advance-music-generation))",
                       builder.PRIVATE_FUNCTIONS["play-current-song"])
         self.assertIn("(var generation (advance-music-generation))",
@@ -77,6 +79,12 @@ class PrivateBuilderTests(unittest.TestCase):
     def test_private_input_and_output_paths_cannot_target_repository(self):
         with self.assertRaisesRegex(ValueError, "outside the repository"):
             builder.require_private_path(ROOT / "private-media.s8", "sample")
+
+    def test_function_names_do_not_match_longer_prefixes(self):
+        source = '(defun status () true)\n(defun status-locked () false)'
+        self.assertEqual(builder.extract_defun(source, 'status'), '(defun status () true)')
+        self.assertEqual(builder.replace_defun(source, 'status', '(defun status () 1)'),
+                         '(defun status () 1)\n(defun status-locked () false)')
 
     def test_function_replacement_skips_comments_and_parentheses_in_strings(self):
         source = '(defun target () { (print "(ignored)") ; ) ignored\n true })\n(defun other () nil)'

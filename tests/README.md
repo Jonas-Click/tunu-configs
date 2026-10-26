@@ -11,6 +11,15 @@ python3 tests/test_warp_samples.py
 python3 tests/test_warp_samples.py --source /path/to/private/bundle/vesc/app.lisp --repl /path/to/lispBM/repl/repl
 ```
 
+Engine-sound tests run the actual Lisp renderer, command/status handlers and generation-aware MIDI lifecycle with mocked VESC IO:
+
+```sh
+LBM_REPL=/path/to/lispBM/repl/repl PYTHONDONTWRITEBYTECODE=1 \
+  python3 -m unittest discover -s tests -p 'test_engine_*.py' -v
+```
+
+Coverage includes five styles, bounded demo synthesis, exact volume echo, command retries, foreground audio priority, natural completion, same-song replay and worker cleanup. The builder tests preserve target-specific functions and every native/private import. See [engine sound](../tools/engine-sound/README.md) for protocol and installation details.
+
 Timed boost tests run without hardware:
 
 ```sh

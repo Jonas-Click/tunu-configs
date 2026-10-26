@@ -15,7 +15,7 @@ SAMPLE_FUNCTIONS = {
     "advance-music-generation", "play-axelf", "play-current-song", "play-warp-samples",
     "play-warp-samples-track", "stop-music", "warp-finish-if-current",
     "warp-generation-current", "warp-queue-chunk", "warp-queue-initial",
-    "warp-wait-until",
+    "warp-wait-until", "music-generation-current",
 }
 SAMPLE_CONFIG = {
     "warp-samples-enabled", "warp-song-number", "warp-sample-rate",
@@ -111,6 +111,8 @@ def private_runtime_source(source, repl):
 (def music-play-generation 0)
 (def current-song 0)
 (def music-playing false)
+(def music-starting false)
+(def music-active-tracks 0)
 (def music-master-vol 0.5)
 (def music-t-start (systime))
 (def channels (map (fn (x) (list x 0 0 0 0)) (range 4)))
@@ -157,11 +159,14 @@ def private_runtime_source(source, repl):
   (var value (advance-music-generation))
   (atomic (if (= slot 0) (setq gen-a value) (setq gen-b value)))
 })
-(defun play-midi-track (parser volume decay song) true)
+(defun engine-pause () true)
+(defun play-midi-track (parser volume decay song generation) true)
 (defun reset-test-state () {
   (setq music-play-generation 0)
   (setq current-song 0)
   (setq music-playing false)
+  (setq music-starting false)
+  (setq music-active-tracks 0)
   (setq calls 0)
   (setq gen1-calls 0)
   (setq gen2-calls 0)

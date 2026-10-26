@@ -25,8 +25,7 @@ IMPORTS = "\n".join(
     '(import "samples/warp-sample-%d.s8" \'warp-sample-%d)' % (i, i)
     for i in range(12)
 )
-CONFIG = """(def music-play-generation 0)
-(def warp-samples-enabled true)
+CONFIG = """(def warp-samples-enabled true)
 (def warp-song-number %d)
 (def warp-sample-rate 16000.0)
 (def warp-sample-voltage 0.15)
@@ -41,14 +40,7 @@ INIT = """(def warp-play-buffer-a (array-create 4000))
                                   warp-sample-9 warp-sample-10 warp-sample-11))"""
 DISPATCH = "((and warp-samples-enabled (= cmd warp-song-number)) (play-warp-samples))"
 
-WARP_FUNCTIONS = r'''(defun advance-music-generation () {
-    (atomic {
-        (def music-play-generation (+ music-play-generation 1))
-        music-play-generation
-    })
-})
-
-(defun warp-generation-current (generation)
+WARP_FUNCTIONS = r'''(defun warp-generation-current (generation)
     (atomic (= generation music-play-generation))
 )
 
@@ -88,6 +80,8 @@ WARP_FUNCTIONS = r'''(defun advance-music-generation () {
     (atomic (if (= generation music-play-generation) {
         (def music-play-generation (+ music-play-generation 1))
         (def current-song 0)
+        (def music-active-tracks 0)
+        (def music-starting false)
         (foc-play-stop)
         (loopforeach ch channels { (setix ch 1 0) })
         (def music-playing false)
@@ -139,64 +133,24 @@ WARP_FUNCTIONS = r'''(defun advance-music-generation () {
 
 (defun play-warp-samples () {
     (var generation (advance-music-generation))
-    (def current-song 0)
-    (sleep 0.05)
-    (atomic (if (= generation music-play-generation) {
+    (atomic {
+        (def music-starting true)
+        (def current-song 0)
+        (def music-playing false)
+        (def music-active-tracks 0)
+        (engine-pause)
         (foc-play-stop)
         (loopforeach ch channels { (setix ch 1 0) })
+    })
+    (sleep 0.05)
+    (atomic (if (= generation music-play-generation) {
         (def music-t-start (systime))
         (def current-song warp-song-number)
         (def music-playing true)
+        (def music-starting false)
         (spawn 200 play-warp-samples-track generation)
     }))
 })'''
-
-PRIVATE_FUNCTIONS = {
-    "stop-music": '''(defun stop-music () {
-    (var generation (advance-music-generation))
-    (def current-song 0)
-    (sleep 0.05)
-    (atomic (if (= generation music-play-generation) {
-        (foc-play-stop)
-        (loopforeach ch channels { (setix ch 1 0) })
-        (def music-playing false)
-    }))
-})''',
-    "play-current-song": '''(defun play-current-song () {
-    (var generation (advance-music-generation))
-    (def current-song 0)
-    (sleep 0.05)
-    (if (= generation music-play-generation) {
-        (if (or song-buf-0-ready song-buf-1-ready) {
-            (foc-play-stop)
-            (if song-buf-0-ready (ext-midi-open 0 song-buf-0))
-            (if song-buf-1-ready (ext-midi-open 1 song-buf-1))
-            (def music-t-start (systime))
-            (def current-song resident-song-number)
-            (if song-buf-0-ready (spawn 200 play-midi-track 0 song-buf-0-vol song-buf-0-decay resident-song-number))
-            (if song-buf-1-ready (spawn 200 play-midi-track 1 song-buf-1-vol song-buf-1-decay resident-song-number))
-            (def music-playing true)
-        } {
-            (print "No song buffer ready to play")
-        })
-    })
-})''',
-    "play-axelf": '''(defun play-axelf () {
-    (var generation (advance-music-generation))
-    (def current-song 0)
-    (sleep 0.05)
-    (if (= generation music-play-generation) {
-        (foc-play-stop)
-        (ext-midi-open 0 song1-track0)
-        (ext-midi-open 1 song1-track1)
-        (def music-t-start (systime))
-        (def current-song axelf-song-number)
-        (spawn 200 play-midi-track 0 2 0.92 axelf-song-number)
-        (spawn 200 play-midi-track 1 1.0 0.92 axelf-song-number)
-        (def music-playing true)
-    })
-})''',
-}
 
 MARKERS = {
     "; @private-warp-imports": IMPORTS,
@@ -207,11 +161,11 @@ MARKERS = {
 }
 
 
-def replace_defun(source, name, replacement):
-    prefix = "(defun " + name
-    start = source.find(prefix)
-    if start < 0 or source.find(prefix, start + len(prefix)) >= 0:
+def defun_span(source, name):
+    matches = list(re.finditer(r"\(defun\s+" + re.escape(name) + r"(?=\s)", source))
+    if len(matches) != 1:
         raise ValueError("expected one definition of " + name)
+    start = matches[0].start()
     depth = 0
     in_string = escaped = in_comment = False
     for offset in range(start, len(source)):
@@ -237,8 +191,22 @@ def replace_defun(source, name, replacement):
         elif char == ")":
             depth -= 1
             if depth == 0:
-                return source[:start] + replacement + source[offset + 1:]
+                return start, offset + 1
     raise ValueError("unterminated definition of " + name)
+
+
+def extract_defun(source, name):
+    start, end = defun_span(source, name)
+    return source[start:end]
+
+
+def replace_defun(source, name, replacement):
+    start, end = defun_span(source, name)
+    return source[:start] + replacement + source[end:]
+
+
+PRIVATE_FUNCTIONS = {name: extract_defun((REPO / 'app.lisp').read_text(), name)
+                     for name in ('stop-music', 'play-current-song', 'play-axelf')}
 
 
 def injected_app(source):
