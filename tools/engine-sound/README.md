@@ -1,8 +1,8 @@
 # Engine sound
 
-Lisp application version 3 implements music-service's engine-sound protocol using VESC's existing four polyphonic audio channels. No controller firmware replacement or riding-limit change is needed. The controller starts silent on every boot; music-service owns the persistent mode and sends the requested state when appropriate.
+Lisp application version 4 implements music-service's engine-sound protocol using VESC's existing four polyphonic audio channels. No controller firmware replacement or riding-limit change is needed. The controller starts silent on every boot; music-service owns the persistent mode and sends the requested state when appropriate.
 
-The presets are procedural V8, moped, sport, V-twin and electric sounds. Pitch follows calibrated speed through five virtual gears, with throttle-dependent level and braked stationary revving. Start/stop cues are synthesized, not imported recordings. The four partials are energy-normalized, frequency-bounded to 70-5000 Hz and slew-limited. Their total modulation voltage stays below 0.2 V at full volume. This is an audio overlay, not a change to phase current, battery current, power, speed, field weakening or regen configuration.
+The presets are procedural V8, moped, sport, V-twin and electric sounds. Pitch follows calibrated speed through five virtual gears, with throttle-dependent level and braked stationary revving. Start/stop cues are synthesized, not imported recordings. The four partials are energy-normalized, frequency-bounded to 70-5000 Hz and slew-limited. Their summed peak modulation stays below 1.7 V at full volume, within the existing MIDI player's voltage range. Smoothing uses elapsed seconds rather than raw system ticks; modulation phase stays bounded independently of controller uptime. This is an audio overlay, not a change to phase current, battery current, power, speed, field weakening or regen configuration.
 
 ## Commands and priority
 
@@ -45,7 +45,9 @@ python3 tools/engine-sound/build.py \
   --output-dir /private/engine-build
 ```
 
-The builder adds the engine renderer, updates generation-aware music lifecycle functions and patches the required entry points. It verifies that the target's shutdown, temperature, speed/odometer reporting and KERS functions remain identical. Every import is retained byte-for-byte, including native MIDI and private samples. It does not add or enable boost. Output stays outside the repository in a private directory.
+For an app that already has engine sound, explicitly pass `--upgrade-engine` after reviewing the backed-up source. That replaces the engine functions/defaults without duplicating command, upload or worker hooks.
+
+The builder adds or upgrades the engine renderer, updates generation-aware music lifecycle functions and patches the required entry points. It verifies that the target's shutdown, temperature, speed/odometer reporting and KERS functions remain identical. Every import is retained byte-for-byte, including native MIDI and private samples. It does not add or enable boost. Output stays outside the repository in a private directory.
 
 Before installation, validate the complete image, source and imports. Pin the controller identity, back up its current motor/app configuration and odometer, keep app output inhibited while stationary, perform complete warm and cold readbacks, and compare configuration while separately bounding expected sensor auto-zero changes. Disarm the alarm before an authorized sound test and restore its prior policy afterward; motor vibration can trigger motion detection. Never unlock or conduct a riding test without explicit authorization.
 
@@ -56,4 +58,4 @@ LBM_REPL=/path/to/lispBM/repl/repl PYTHONDONTWRITEBYTECODE=1 \
   python3 -m unittest discover -s tests -p 'test_engine_*.py' -v
 ```
 
-Tests execute the actual controller functions in host LispBM: all styles and demo phases, modulation bounds, exact percentage/status encoding, malformed commands, idempotence, music/upload priority, braked revving, virtual gears, natural two-track completion, same-song replay and worker-error cleanup. The spawned worker is also exercised with its controller stack allocation. Set `ENGINE_APP_SOURCE` to a generated target app to test those same functions after backporting.
+Tests execute the actual controller functions in host LispBM: all styles and demo phases, modulation bounds, exact percentage/status encoding, malformed commands, idempotence, music/upload priority, braked revving, virtual gears, natural two-track completion, same-song replay and worker-error cleanup. A 10000 Hz tick-clock regression checks real-time slew, audible idle level and live speed/throttle/brake response. The spawned worker is also exercised with its controller stack allocation. Set `ENGINE_APP_SOURCE` to a generated target app to test those same functions after backporting.

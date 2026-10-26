@@ -33,10 +33,18 @@ def replace_once(source, before, after):
     return source.replace(before, after)
 
 
-def add_engine(source, canonical=None):
+def add_engine(source, canonical=None, upgrade=False):
     canonical = canonical if canonical is not None else (REPO / 'app.lisp').read_text()
-    if re.search(r'^\(defun engine-step\b', source, re.M):
-        raise ValueError('source already contains engine sound; review its upgrade separately')
+    has_engine = bool(re.search(r'^\(defun engine-step\b', source, re.M))
+    if has_engine and not upgrade:
+        raise ValueError('source already contains engine sound; use the explicit upgrade option after review')
+    if upgrade and not has_engine:
+        raise ValueError('engine upgrade requires an existing engine implementation')
+    if upgrade:
+        for hook in ('(engine-init)', '(spawn 300 engine-loop)', '(def dataArray_0x7ED (array-create 4))',
+                     '(if (= id 0x4EAu32) (handle-engine-command data))'):
+            if source.count(hook) != 1:
+                raise ValueError('expected one existing engine hook: ' + hook)
     protected = {name: warp.extract_defun(source, name) for name in PROTECTED_FUNCTIONS}
     before_imports = flash.source_imports(source.encode())
     states = []
@@ -46,12 +54,15 @@ def add_engine(source, canonical=None):
             existing = re.findall(r'^\(def ' + re.escape(match[1]) + r'\s.+\)$', source, re.M)
             if len(existing) > 1:
                 raise ValueError('duplicate state: ' + match[1])
-            if not existing:
+            if existing and upgrade and match[1].startswith('engine-'):
+                source = re.sub(r'^' + re.escape(existing[0]) + r'$', lambda _: line, source, count=1, flags=re.M)
+            elif not existing:
                 states.append(line)
-    if not states:
+    if not states and not has_engine:
         raise ValueError('canonical engine state is missing')
-    source = replace_once(source, '\n(def music-t-start (systime))\n',
-                          '\n(def music-t-start (systime))\n' + '\n'.join(states) + '\n')
+    if states:
+        source = replace_once(source, '\n(def music-t-start (systime))\n',
+                              '\n(def music-t-start (systime))\n' + '\n'.join(states) + '\n')
     functions = re.findall(r'^\(defun ((?:engine-[A-Za-z0-9_-]+)|handle-engine-command|send-engine-status(?:-locked)?)\s', canonical, re.M)
     if 'engine-step' not in functions or 'engine-loop' not in functions:
         raise ValueError('canonical engine functions are missing')
@@ -64,27 +75,31 @@ def add_engine(source, canonical=None):
             additions.append(definition)
     source = replace_once(source, '; ===== Music: polyphony engine =====',
                           '\n\n'.join(additions) + '\n\n; ===== Music: polyphony engine =====')
-    for name in ('handle-upload-begin', 'handle-upload-chunk', 'handle-upload-end'):
-        definition = warp.extract_defun(source, name)
-        opening = '(defun ' + name + ' (data) {'
-        update = opening + '\n    (def music-upload-last (systime))'
-        if name == 'handle-upload-begin':
-            update += '\n    (engine-pause)'
-        source = warp.replace_defun(source, name, replace_once(definition, opening, update))
-    source = replace_once(source, '    ; Music_Control_ID2 (0x4E9) - master volume',
-                          '    (if (= id 0x4EAu32) (handle-engine-command data))\n\n'
-                          '    ; Music_Control_ID2 (0x4E9) - master volume')
-    source = replace_once(source, '(send-music-status)\n    })\n\n    ; Control_Message_ID1',
-                          '(send-music-status)\n        (send-engine-status)\n    })\n\n    ; Control_Message_ID1')
-    source = replace_once(source, '    (def dataArray_0x7EC (array-create 1))\n',
-                          '    (def dataArray_0x7EC (array-create 1))\n    (def dataArray_0x7ED (array-create 4))\n')
-    source = replace_once(source, '    (ext-midi-init 2) ; 2 simultaneous MIDI parsers = max 2 tracks per song\n',
-                          '    (ext-midi-init 2) ; 2 simultaneous MIDI parsers = max 2 tracks per song\n    (engine-init)\n')
-    source = replace_once(source, '    (spawn 200 decay-loop)\n',
-                          '    (spawn 200 decay-loop)\n    (spawn 300 engine-loop)\n')
-    source = replace_once(source, '(list abs loopforeach looprange loopwhile)',
-                          '(list abs sin loopforeach looprange loopwhile)')
-    source, versions = re.subn(r'^\(def sw-app-version [0-9]+\)$', '(def sw-app-version 3)', source, flags=re.M)
+    if not has_engine:
+        for name in ('handle-upload-begin', 'handle-upload-chunk', 'handle-upload-end'):
+            definition = warp.extract_defun(source, name)
+            opening = '(defun ' + name + ' (data) {'
+            update = opening + '\n    (def music-upload-last (systime))'
+            if name == 'handle-upload-begin':
+                update += '\n    (engine-pause)'
+            source = warp.replace_defun(source, name, replace_once(definition, opening, update))
+        source = replace_once(source, '    ; Music_Control_ID2 (0x4E9) - master volume',
+                              '    (if (= id 0x4EAu32) (handle-engine-command data))\n\n'
+                              '    ; Music_Control_ID2 (0x4E9) - master volume')
+        source = replace_once(source, '(send-music-status)\n    })\n\n    ; Control_Message_ID1',
+                              '(send-music-status)\n        (send-engine-status)\n    })\n\n    ; Control_Message_ID1')
+        source = replace_once(source, '    (def dataArray_0x7EC (array-create 1))\n',
+                              '    (def dataArray_0x7EC (array-create 1))\n    (def dataArray_0x7ED (array-create 4))\n')
+        source = replace_once(source, '    (ext-midi-init 2) ; 2 simultaneous MIDI parsers = max 2 tracks per song\n',
+                              '    (ext-midi-init 2) ; 2 simultaneous MIDI parsers = max 2 tracks per song\n    (engine-init)\n')
+        source = replace_once(source, '    (spawn 200 decay-loop)\n',
+                              '    (spawn 200 decay-loop)\n    (spawn 300 engine-loop)\n')
+        source = replace_once(source, '(list abs loopforeach looprange loopwhile)',
+                              '(list abs sin loopforeach looprange loopwhile)')
+    app_version = re.search(r'^\(def sw-app-version ([0-9]+)\)$', canonical, re.M)
+    if not app_version:
+        raise ValueError('canonical app version is missing')
+    source, versions = re.subn(r'^\(def sw-app-version [0-9]+\)$', app_version[0], source, flags=re.M)
     if versions != 1:
         raise ValueError('expected one app version')
     if '(def warp-samples-enabled true)' in source:
@@ -98,11 +113,11 @@ def add_engine(source, canonical=None):
     return source
 
 
-def build(backup, output):
+def build(backup, output, upgrade=False):
     backup = warp.require_private_path(backup, 'target backup')
     output = warp.prepare_private_output(output)
     original = (backup / 'before.lisp').read_text()
-    source = add_engine(original)
+    source = add_engine(original, upgrade=upgrade)
     metadata = json.loads((backup / 'installed-imports.json').read_text())
     wanted = {tag for _, tag in flash.source_imports(source.encode())}
     overrides = {}
@@ -133,7 +148,8 @@ def build(backup, output):
     manifest = {'image_bytes': len(image), 'image_sha256': hashlib.sha256(image).hexdigest(),
                 'source_sha256': hashlib.sha256(source.encode()).hexdigest(),
                 'before_source_sha256': hashlib.sha256(original.encode()).hexdigest(),
-                'imports': metadata, 'app_version': 3, 'protected_functions': list(PROTECTED_FUNCTIONS)}
+                'imports': metadata, 'app_version': int(re.search(r'^\(def sw-app-version ([0-9]+)\)$', source, re.M)[1]),
+                'protected_functions': list(PROTECTED_FUNCTIONS)}
     (output / 'build.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print('engine image: %d/%d bytes; %d target imports preserved' % (len(image), flash.MAX_IMAGE_SIZE, len(imports)))
     return manifest
@@ -143,8 +159,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--backup-dir', type=Path, required=True)
     parser.add_argument('--output-dir', type=Path, required=True)
+    parser.add_argument('--upgrade-engine', action='store_true', help='explicitly replace reviewed existing engine functions and defaults')
     args = parser.parse_args()
-    build(args.backup_dir, args.output_dir)
+    build(args.backup_dir, args.output_dir, upgrade=args.upgrade_engine)
 
 
 if __name__ == '__main__':

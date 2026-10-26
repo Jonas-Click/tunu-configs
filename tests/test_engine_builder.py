@@ -26,7 +26,7 @@ class EngineBuilderTests(unittest.TestCase):
             source = source.replace(line, '')
         source = source.replace('(list abs sin loopforeach looprange loopwhile)',
                                 '(list abs loopforeach looprange loopwhile)')
-        source = source.replace('(def sw-app-version 3)', '(def sw-app-version 1)')
+        source = source.replace('(def sw-app-version 4)', '(def sw-app-version 1)')
         source = builder.warp.replace_defun(source, 'send-status2', '(defun send-status2 () 25)')
         return source
 
@@ -51,7 +51,7 @@ class EngineBuilderTests(unittest.TestCase):
             metadata = builder.build(backup, output)
             source, imports = builder.flash.unpack_blob(builder.flash.validate_image((output / 'engine.img').read_bytes()))
             source = source.decode()
-            self.assertIn('(def sw-app-version 3)', source)
+            self.assertIn('(def sw-app-version 4)', source)
             self.assertIn('(defun send-status2 () 25)', source)
             self.assertIn('(spawn 300 engine-loop)', source)
             self.assertIn('(if (= id 0x4EAu32) (handle-engine-command data))', source)
@@ -61,7 +61,7 @@ class EngineBuilderTests(unittest.TestCase):
                 self.assertEqual(builder.warp.extract_defun(original, name), builder.warp.extract_defun(source, name))
             for tag, data in imports.items():
                 self.assertEqual(data, (backup / ('installed-' + tag + '.bin')).read_bytes() + b'\0')
-            self.assertEqual(metadata['app_version'], 3)
+            self.assertEqual(metadata['app_version'], 4)
             self.assertEqual(output.stat().st_mode & 0o777, 0o700)
 
     def test_existing_engine_or_missing_hook_requires_review(self):
@@ -70,6 +70,24 @@ class EngineBuilderTests(unittest.TestCase):
         source = self.legacy_source().replace('(spawn 200 decay-loop)', '(spawn 250 decay-loop)')
         with self.assertRaisesRegex(ValueError, 'expected one source hook'):
             builder.add_engine(source)
+
+    def test_explicit_upgrade_replaces_engine_defaults_without_duplicating_hooks(self):
+        source = (ROOT / 'app.lisp').read_text().replace('(def sw-app-version 4)', '(def sw-app-version 3)')
+        source = source.replace('(def engine-tone-voltage 1.0)', '(def engine-tone-voltage 0.12)')
+        source = source.replace('(def engine-wobble-phase 0.0)\n', '', 1)
+        result = builder.add_engine(source, upgrade=True)
+        self.assertIn('(def engine-tone-voltage 1.0)', result)
+        self.assertIn('(def engine-wobble-phase 0.0)', result)
+        self.assertIn('(def sw-app-version 4)', result)
+        for hook in ('(spawn 300 engine-loop)', '(def dataArray_0x7ED (array-create 4))',
+                     '(if (= id 0x4EAu32) (handle-engine-command data))'):
+            self.assertEqual(result.count(hook), 1, hook)
+        for name in builder.PROTECTED_FUNCTIONS:
+            self.assertEqual(builder.warp.extract_defun(source, name), builder.warp.extract_defun(result, name))
+        with self.assertRaisesRegex(ValueError, 'requires an existing'):
+            builder.add_engine(self.legacy_source(), upgrade=True)
+        with self.assertRaisesRegex(ValueError, 'existing engine hook'):
+            builder.add_engine(source.replace('(spawn 300 engine-loop)', '(spawn 350 engine-loop)'), upgrade=True)
 
     def test_corrupt_resource_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -17,7 +17,7 @@
 (def motor-power-kw 0x03)
 (def max-speed-kmh 0x45)
 (def sw-base-version 0x10)  ; "1.0"
-(def sw-app-version 3)
+(def sw-app-version 4)
 
 (def pole-pairs 24.0)
 
@@ -324,7 +324,8 @@
 (def engine-model-speed 0.0)
 (def engine-model-throttle 0.0)
 (def engine-model-brake 0.0)
-(def engine-tone-voltage 0.12)
+(def engine-wobble-phase 0.0)
+(def engine-tone-voltage 1.0)
 (def engine-demo-seconds 30.0)
 
 ; Music functions live in flash (@const-start/@const-end), not the RAM cell
@@ -365,6 +366,7 @@
     (def engine-owned false)
     (def engine-rpm 0.0)
     (def engine-gain 0.0)
+    (def engine-wobble-phase 0.0)
     (def engine-last-step (systime))
     (def engine-last-status (systime))
     (def music-play-generation 0)
@@ -470,7 +472,7 @@
 (defun engine-step ()
     (atomic {
         (var now (systime))
-        (var dt (engine-clamp (- now engine-last-step) 0.0 0.1))
+        (var dt (engine-clamp (secs-since engine-last-step) 0.0 0.1))
         (def engine-last-step now)
         (if (and engine-demo-playing (>= (secs-since engine-demo-start) engine-demo-seconds)) {
             (def engine-demo-playing false)
@@ -521,7 +523,10 @@
                 })
                 (def engine-rpm (+ engine-rpm (engine-clamp (- target engine-rpm) (* -9000.0 dt) (* 9000.0 dt))))
                 (def engine-gain (+ engine-gain (engine-clamp (- level engine-gain) (* -5.0 dt) (* 5.0 dt))))
-                (var wobble (+ 1.0 (* 0.015 (sin (* now (if (= engine-style 3) 29.0 43.0))))))
+                (def engine-wobble-phase (+ engine-wobble-phase (* dt (if (= engine-style 3) 29.0 43.0))))
+                (if (>= engine-wobble-phase 6.2831853)
+                    (def engine-wobble-phase (- engine-wobble-phase 6.2831853)))
+                (var wobble (+ 1.0 (* 0.015 (sin engine-wobble-phase))))
                 (looprange channel 0 4 {
                     (var frequency (engine-clamp (* (/ engine-rpm 60.0) (ix (ix profile 3) channel) wobble) 70.0 5000.0))
                     (var voltage (* engine-tone-voltage engine-gain (ix (ix profile 4) channel)))
