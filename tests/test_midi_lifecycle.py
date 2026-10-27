@@ -50,6 +50,7 @@ PRELUDE = r'''
 (def song-status-events 0)
 (def tone-events 0)
 (def stop-events 0)
+(defun engine-pause () true)
 (def song-buf-0-ready true)
 (def song-buf-1-ready true)
 (def song-buf-0 (array-create 8))

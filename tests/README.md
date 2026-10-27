@@ -1,4 +1,15 @@
-# Current-limit tests
+# Controller tests
+
+Engine-sound and MIDI lifecycle tests execute the actual Lisp functions with mocked VESC I/O:
+
+```sh
+LBM_REPL=/path/to/lispBM/repl/repl python3 -m unittest discover -s tests -p 'test_engine_sound.py' -v
+LBM_REPL=/path/to/lispBM/repl/repl python3 -m unittest discover -s tests -p 'test_midi_lifecycle.py' -v
+```
+
+The engine tests cover commands, timing, speed/throttle/brake response, music priority, bounded audio and worker cleanup.
+
+## Current-limit tests
 
 Run with Python 3 and a host LispBM REPL:
 

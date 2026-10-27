@@ -20,7 +20,7 @@
 (def motor-power-kw 0x03)
 (def max-speed-kmh 0x45)
 (def sw-base-version 0x10)  ; "1.0"
-(def sw-app-version 1)
+(def sw-app-version 4)
 
 (def pole-pairs 24.0)
 
@@ -268,6 +268,26 @@
 (def music-play-generation 0)
 (def music-active-tracks 0)
 (def music-starting false)
+(def music-upload-last -100.0)
+(def engine-enabled false)
+(def engine-volume 50)
+(def engine-style 0)
+(def engine-demo-playing false)
+(def engine-demo-start 0.0)
+(def engine-start-pending false)
+(def engine-cue 0)
+(def engine-cue-start 0.0)
+(def engine-owned false)
+(def engine-rpm 0.0)
+(def engine-gain 0.0)
+(def engine-last-step 0.0)
+(def engine-last-status 0.0)
+(def engine-model-speed 0.0)
+(def engine-model-throttle 0.0)
+(def engine-model-brake 0.0)
+(def engine-wobble-phase 0.0)
+(def engine-tone-voltage 1.0)
+(def engine-demo-seconds 30.0)
 
 ; Music functions live in flash (@const-start/@const-end), not the RAM cell
 ; heap: upstream alone already fills about half the heap, and the music code
@@ -299,6 +319,221 @@
             (send-music-status)
         })
     })))
+
+(defun engine-clamp (value low high)
+    (if (< value low) low (if (> value high) high value)))
+
+(defun engine-profile (style)
+    (cond
+        ((= style 1) '(1800.0 280.0 8800.0 (2.0 4.0 6.0 9.0) (0.885 0.442 0.147 0.0)))
+        ((= style 2) '(1600.0 350.0 11500.0 (4.0 8.0 12.0 16.0) (0.873 0.444 0.190 0.079)))
+        ((= style 3) '(950.0 180.0 5200.0 (3.0 4.5 7.5 10.5) (0.958 0.260 0.123 0.027)))
+        ((= style 4) '(1000.0 180.0 8000.0 (9.0 18.0 27.0 36.0) (0.965 0.241 0.096 0.024)))
+        (t '(1100.0 220.0 6200.0 (4.0 8.0 12.0 16.0) (0.884 0.402 0.225 0.096)))))
+
+(defun engine-pause () {
+    (if engine-owned {
+        (looprange channel 0 4 { (foc-play-tone channel 500.0 0.0) })
+        (def engine-owned false)
+    })
+    (def engine-gain 0.0)
+})
+
+(defun engine-init () {
+    (foc-play-stop)
+    (def engine-enabled false)
+    (def engine-volume 50)
+    (def engine-style 0)
+    (def engine-demo-playing false)
+    (def engine-start-pending false)
+    (def engine-cue 0)
+    (def engine-owned false)
+    (def engine-rpm 0.0)
+    (def engine-gain 0.0)
+    (def engine-wobble-phase 0.0)
+    (def engine-last-step (systime))
+    (def engine-last-status (systime))
+    (def music-play-generation 0)
+    (def music-active-tracks 0)
+    (def music-starting false)
+    (def music-playing false)
+    (def current-song 0)
+    (def music-upload-last -100.0)
+})
+
+(defun send-engine-status-locked () {
+    (bufset-u8 dataArray_0x7ED 0 (if engine-enabled 1 0))
+    (bufset-u8 dataArray_0x7ED 1 engine-volume)
+    (bufset-u8 dataArray_0x7ED 2 (if engine-demo-playing 1 0))
+    (bufset-u8 dataArray_0x7ED 3 engine-style)
+    (can-send-sid 0x7ED dataArray_0x7ED)
+    (def engine-last-status (systime))
+})
+
+(defun send-engine-status () (atomic (send-engine-status-locked)))
+
+(defun handle-engine-command (data) {
+    (if (>= (buflen data) 2) {
+        (var command (bufget-u8 data 0))
+        (var volume (engine-clamp (bufget-u8 data 1) 0 100))
+        (var style (if (>= (buflen data) 3) (bufget-u8 data 2) engine-style))
+        (if (and (<= command 2) (<= style 4))
+            (atomic {
+                (def engine-volume volume)
+                (def engine-style style)
+                (cond
+                    ((= command 0) {
+                        (var stop-cue (and engine-enabled engine-owned (not engine-demo-playing)))
+                        (def engine-enabled false)
+                        (def engine-demo-playing false)
+                        (def engine-start-pending false)
+                        (if stop-cue {
+                            (def engine-cue 2)
+                            (def engine-cue-start (systime))
+                        } {
+                            (def engine-cue 0)
+                            (engine-pause)
+                        })
+                    })
+                    ((= command 1) {
+                        (if (and (not engine-enabled) (not engine-demo-playing)) {
+                            (def engine-start-pending true)
+                            (def engine-cue 0)
+                        })
+                        (def engine-enabled true)
+                    })
+                    ((= command 2) {
+                        (if (not engine-demo-playing) {
+                            (def engine-demo-playing true)
+                            (def engine-demo-start (systime))
+                            (if (not engine-owned) (def engine-start-pending true))
+                            (def engine-cue 0)
+                        })
+                    })
+                )
+            }))
+    })
+    (send-engine-status)
+})
+
+(defun engine-demo-input (age) {
+    (def engine-model-speed 0.0)
+    (def engine-model-throttle 0.0)
+    (def engine-model-brake 0.0)
+    (cond
+        ((< age 1.0) nil)
+        ((< age 10.0) {
+            (def engine-model-speed (* 5.0 (- age 1.0)))
+            (def engine-model-throttle 0.85)
+        })
+        ((< age 14.0) {
+            (def engine-model-speed 45.0)
+            (def engine-model-throttle 0.2)
+        })
+        ((< age 20.0) {
+            (def engine-model-speed (* 45.0 (- 1.0 (/ (- age 14.0) 6.0))))
+            (def engine-model-brake 0.5)
+        })
+        ((< age 27.0) {
+            (def engine-model-throttle (+ 0.5 (* 0.5 (sin (* (- age 20.0) 3.0)))))
+            (def engine-model-brake 1.0)
+        })
+    )
+})
+
+(defun engine-target-rpm (profile speed throttle brake) {
+    (var ratio (cond ((< speed 10.0) 1.0) ((< speed 23.0) 0.72)
+                     ((< speed 36.0) 0.52) ((< speed 50.0) 0.40) (t 0.32)))
+    (var idle (ix profile 0))
+    (var limit (ix profile 2))
+    (var target (+ idle (* speed (ix profile 1) ratio) (* throttle 600.0)))
+    (if (and (< speed 1.0) (> brake 0.2))
+        (setq target (+ idle (* throttle (- limit idle) 0.8))))
+    (engine-clamp target idle limit)
+})
+
+(defun engine-step ()
+    (atomic {
+        (var now (systime))
+        (var dt (engine-clamp (secs-since engine-last-step) 0.0 0.1))
+        (def engine-last-step now)
+        (if (and engine-demo-playing (>= (secs-since engine-demo-start) engine-demo-seconds)) {
+            (def engine-demo-playing false)
+            (if (not engine-enabled) {
+                (def engine-start-pending false)
+                (def engine-cue (if engine-owned 2 0))
+                (def engine-cue-start now)
+            })
+            (send-engine-status-locked)
+        })
+        (if (or music-playing music-starting (< (secs-since music-upload-last) 0.3)
+                (!= (get-fault) 0)) {
+            (engine-pause)
+        } {
+            (if (and engine-start-pending (or engine-enabled engine-demo-playing)) {
+                (def engine-start-pending false)
+                (def engine-cue 1)
+                (def engine-cue-start now)
+            })
+            (if (and (= engine-cue 1) (>= (secs-since engine-cue-start) 0.65))
+                (def engine-cue 0))
+            (if (and (= engine-cue 2) (>= (secs-since engine-cue-start) 0.35))
+                (def engine-cue 0))
+            (if (or engine-enabled engine-demo-playing (= engine-cue 2)) {
+                (var profile (engine-profile engine-style))
+                (def engine-model-speed (abs (/ (* (get-speed) 3.6) speed-cal)))
+                (def engine-model-throttle (engine-clamp (get-adc-decoded 0) 0.0 1.0))
+                (def engine-model-brake (engine-clamp (get-adc-decoded 1) 0.0 1.0))
+                (if engine-demo-playing (engine-demo-input (secs-since engine-demo-start)))
+                (var target (engine-target-rpm profile engine-model-speed engine-model-throttle engine-model-brake))
+                (var level (* (/ (to-float engine-volume) 100.0)
+                              (+ 0.45 (* 0.55 engine-model-throttle))))
+                (var cue-age (secs-since engine-cue-start))
+                (if (= engine-cue 1) {
+                    (var factor (cond
+                        ((< cue-age 0.2) (+ 0.35 (* 3.25 cue-age)))
+                        ((< cue-age 0.4) (+ 1.0 (* 4.5 (- cue-age 0.2))))
+                        (t (- 1.9 (* 3.6 (- cue-age 0.4))))))
+                    (if (= engine-style 1)
+                        (setq factor (+ 0.45 (* 1.4 (abs (sin (* cue-age 10.0)))))))
+                    (setq target (* (ix profile 0) factor))
+                    (setq level (* (/ (to-float engine-volume) 100.0) 0.75))
+                })
+                (if (= engine-cue 2) {
+                    (var remaining (engine-clamp (- 1.0 (/ cue-age 0.35)) 0.0 1.0))
+                    (setq target (* engine-rpm remaining))
+                    (setq level (* (/ (to-float engine-volume) 100.0) 0.45 remaining))
+                })
+                (def engine-rpm (+ engine-rpm (engine-clamp (- target engine-rpm) (* -9000.0 dt) (* 9000.0 dt))))
+                (def engine-gain (+ engine-gain (engine-clamp (- level engine-gain) (* -5.0 dt) (* 5.0 dt))))
+                (def engine-wobble-phase (+ engine-wobble-phase (* dt (if (= engine-style 3) 29.0 43.0))))
+                (if (>= engine-wobble-phase 6.2831853)
+                    (def engine-wobble-phase (- engine-wobble-phase 6.2831853)))
+                (var wobble (+ 1.0 (* 0.015 (sin engine-wobble-phase))))
+                (looprange channel 0 4 {
+                    (var frequency (engine-clamp (* (/ engine-rpm 60.0) (ix (ix profile 3) channel) wobble) 70.0 5000.0))
+                    (var voltage (* engine-tone-voltage engine-gain (ix (ix profile 4) channel)))
+                    (foc-play-tone channel frequency voltage)
+                })
+                (def engine-owned true)
+            } {
+                (engine-pause)
+            })
+        })
+        (if (>= (secs-since engine-last-status) 1.0) (send-engine-status-locked))
+    }))
+
+(defun engine-loop () {
+    (var result (trap (loopwhile t { (engine-step) (sleep 0.02) })))
+    (atomic {
+        (engine-pause)
+        (def engine-enabled false)
+        (def engine-demo-playing false)
+        (def engine-cue 0)
+    })
+    (send-engine-status)
+    (print (list "Engine sound stopped" result))
+})
 
 ; ===== Music: polyphony engine =====
 
@@ -409,6 +644,7 @@
         (def current-song 0)
         (def music-playing false)
         (def music-active-tracks 0)
+        (engine-pause)
         (foc-play-stop)
         (loopforeach ch channels { (setix ch 1 0) })
     })
@@ -441,6 +677,7 @@
         (def current-song 0)
         (def music-playing false)
         (def music-active-tracks 0)
+        (engine-pause)
         (foc-play-stop)
         (loopforeach ch channels { (setix ch 1 0) })
     })
@@ -463,6 +700,8 @@
 ;   byte0 = song number, byte1 = track slot (0 melody/1 bass),
 ;   byte2-3 = length LE u16, byte4 = volume x10, byte5 = decay x100
 (defun handle-upload-begin (data) {
+    (def music-upload-last (systime))
+    (engine-pause)
     (var song-number (bufget-u8 data 0))
     (var track-slot  (bufget-u8 data 1))
     (var track-len (+ (bufget-u8 data 2) (* (bufget-u8 data 3) 256)))
@@ -502,6 +741,7 @@
 ; Music_Upload_Chunk (0x4ED) — byte0 = sequence (informational only; chunks
 ; are appended in arrival order), byte1-7 = up to 7 bytes.
 (defun handle-upload-chunk (data) {
+    (def music-upload-last (systime))
     (if (and (>= upload-active-slot 0) (> (buflen data) 1)) {
         (var n (- (buflen data) 1))
         (var dst (if (= upload-active-slot 0) song-buf-0 song-buf-1))
@@ -521,6 +761,7 @@
 ; success, marks that track slot ready to play. On failure music-service
 ; retries the whole track from Begin.
 (defun handle-upload-end (data) {
+    (def music-upload-last (systime))
     (var song-number (bufget-u8 data 0))
     (var track-slot  (bufget-u8 data 1))
     (var checksum    (bufget-u8 data 2))
@@ -563,6 +804,8 @@
             (t (print (list "Music cmd" cmd "ignored: no matching resident song"))))
         (send-music-status)
     })
+
+    (if (= id 0x4EAu32) (handle-engine-command data))
 
     ; Music_Control_ID2 (0x4E9) - master volume
     ; 4E9#<0..100 in hex>  (e.g. 4E9#50 = 80%)
@@ -642,6 +885,7 @@
         (send-config-block)
         (sleep 0.01)
         (send-music-status)
+        (send-engine-status)
     })
 
     ; Control_Message_ID1 (0x4EB) - Speed limit ratio
@@ -818,6 +1062,7 @@
     (def dataArray_0x7EA (array-create 2))
     (def dataArray_0x7EB (array-create 1))
     (def dataArray_0x7EC (array-create 1))
+    (def dataArray_0x7ED (array-create 4))
     (def dataArray_0x7EE (array-create 2))
     (def dataArray_0x7EF (array-create 2))
 
@@ -846,9 +1091,11 @@
 
     (load-native-lib midi)
     (ext-midi-init 2) ; 2 simultaneous MIDI parsers = max 2 tracks per song
+    (engine-init)
 
     ; Sustain envelope for the music engine
     (spawn 200 decay-loop)
+    (spawn 300 engine-loop)
 
     ; Spawn the event handler thread and pass the ID it returns to C
     (event-register-handler (spawn 150 event-handler))
@@ -900,7 +1147,7 @@
 ; next, which a previous boot may already have filled differently ("already
 ; occupied") and kills the calling thread. Touch every such helper the code
 ; uses at runtime now, so they are baked into the image instead.
-(list abs loopforeach looprange loopwhile)
+(list abs sin loopforeach looprange loopwhile)
 
 (image-save)
 
