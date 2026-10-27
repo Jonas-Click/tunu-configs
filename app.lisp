@@ -261,16 +261,44 @@
 (def num-chan 4)
 ; current-song is the stop/switch signal AND the number echoed on 0x7E6:
 ;   0     = stopped  — track threads exit their loops when they see this
-;   N>0   = playing song N — each thread loops while (= current-song its-own-id)
+;   N>0   = playing song N; generations distinguish same-song replays
 (def music-playing false)
 (def current-song 0)
 (def music-t-start (systime))
+(def music-play-generation 0)
+(def music-active-tracks 0)
+(def music-starting false)
 
 ; Music functions live in flash (@const-start/@const-end), not the RAM cell
 ; heap: upstream alone already fills about half the heap, and the music code
 ; on top of it ran the heap out. Only function definitions go in const
 ; blocks — anything mutated at runtime (channels, flags, buffers) stays in RAM.
 @const-start
+
+(defun advance-music-generation ()
+    (atomic {
+        (def music-play-generation (+ music-play-generation 1))
+        music-play-generation
+    }))
+
+(defun music-generation-current (generation)
+    (= generation music-play-generation))
+
+(defun music-track-finished (generation parser-idx)
+    (atomic (if (= generation music-play-generation) {
+        (var bit (shl 1 parser-idx))
+        (if (!= (bitwise-and music-active-tracks bit) 0)
+            (def music-active-tracks (- music-active-tracks bit)))
+        (if (= music-active-tracks 0) {
+            (def music-play-generation (+ music-play-generation 1))
+            (def current-song 0)
+            (def music-playing false)
+            (def music-starting false)
+            (foc-play-stop)
+            (loopforeach ch channels { (setix ch 1 0) })
+            (send-music-status)
+        })
+    })))
 
 ; ===== Music: polyphony engine =====
 
@@ -281,9 +309,9 @@
     (* vol (if (> f 1.0) 1.0 f))
 })
 
-(defun note-on (note vol decay)
+(defun note-on (note vol decay generation)
     (atomic (loopforeach ch channels {
-        (if (= (ix ch 1) 0) {
+        (if (and (music-generation-current generation) (= (ix ch 1) 0)) {
             (var freq (* 440.0 (pow 2.0 (/ (- note 69.0) 12.0))))
             (var v (* vol music-master-vol))   ; apply live master volume
             (setix ch 2 freq)
@@ -295,9 +323,9 @@
         })
     })))
 
-(defun note-off (note)
+(defun note-off (note generation)
     (atomic (loopforeach ch channels {
-        (if (= (ix ch 1) note) {
+        (if (and (music-generation-current generation) (= (ix ch 1) note)) {
             (setix ch 1 0)
             (foc-play-tone (ix ch 0) 500 0)
             (break)
@@ -317,14 +345,14 @@
 
 ; ===== Music: playback =====
 
-; song-id is baked in at spawn time so the thread knows when to exit
-(defun play-midi-track (parser-idx volts decay song-id) {
+; Both the song and generation must still own playback.
+(defun play-midi-track (parser-idx volts decay song-id generation) {
     (var t-delta 0.0)
     (var midi-tdiv 100)
     (var midi-tempo 400000)
     (var t-offset -1.0)  ; set on first note to skip any silent intro
-    (loopwhile (= current-song song-id)
-        (match (ext-midi-parse parser-idx)
+    (loopwhile (and (= current-song song-id) (music-generation-current generation))
+        (match (atomic (if (music-generation-current generation) (ext-midi-parse parser-idx) 'midi-eob))
             ((midi-header (? size) (? format) (? tracks) (? time-div)) {
                 (setq midi-tdiv time-div)
             })
@@ -336,15 +364,14 @@
                 (var to-sleep (- (- t-delta t-offset) (secs-since music-t-start)))
                 ; Chunked sleep: wake every 50ms to check if song was stopped/changed.
                 ; Prevents a long inter-note gap from delaying the stop response.
-                (loopwhile (and (> to-sleep 0.05) (= current-song song-id)) {
+                (loopwhile (and (> to-sleep 0.05) (= current-song song-id) (music-generation-current generation)) {
                     (sleep 0.05)
                     (setq to-sleep (- to-sleep 0.05))
                 })
-                (if (and (> to-sleep 0.001) (= current-song song-id)) (sleep to-sleep))
-                ; Check again before firing the note — avoids the stray note after stop
-                (if (!= current-song song-id) (break))
-                (if (= status 9) (note-on p1 (vscale volts p2) decay))
-                (if (= status 8) (note-off p1))
+                (if (and (> to-sleep 0.001) (= current-song song-id) (music-generation-current generation)) (sleep to-sleep))
+                (if (not (music-generation-current generation)) (break))
+                (if (= status 9) (note-on p1 (vscale volts p2) decay generation))
+                (if (= status 8) (note-off p1 generation))
             })
             ((midi-track-meta (? time) (? type) (? len) (? data)) {
                 (if (= type 81) (setq midi-tempo data))
@@ -357,47 +384,78 @@
             (_ nil)   ; other events (track headers etc.) need no handling
         )
     )
+    (music-track-finished generation parser-idx)
 })
 
-(defun stop-music () {
-    (def current-song 0)        ; all track threads exit at next loop check
-    (sleep 0.05)                ; give them time to finish current sleep/parse
-    (foc-play-stop)
-    (loopforeach ch channels { (setix ch 1 0) })
-    (def music-playing false)
-})
+(defun stop-music ()
+    (atomic {
+        (def music-play-generation (+ music-play-generation 1))
+        (def current-song 0)
+        (def music-playing false)
+        (def music-starting false)
+        (def music-active-tracks 0)
+        (foc-play-stop)
+        (loopforeach ch channels { (setix ch 1 0) })
+    }))
 
 ; Plays whatever's currently loaded in song-buf-0/1, according to which track
 ; slots handle-upload-end has marked ready.
 (defun play-current-song () {
-    (def current-song 0)        ; stop any running tracks
-    (sleep 0.05)                ; wait before re-opening parsers
-    (if (or song-buf-0-ready song-buf-1-ready) {
-        (if song-buf-0-ready (ext-midi-open 0 song-buf-0))
-        (if song-buf-1-ready (ext-midi-open 1 song-buf-1))
-        ; Set timing reference after parsers are loaded — avoids startup delay
-        (def music-t-start (systime))
-        (def current-song resident-song-number)   ; set before spawning so threads see it immediately
-        (if song-buf-0-ready (spawn 200 play-midi-track 0 song-buf-0-vol song-buf-0-decay resident-song-number))
-        (if song-buf-1-ready (spawn 200 play-midi-track 1 song-buf-1-vol song-buf-1-decay resident-song-number))
-        (def music-playing true)
-    } {
-        (print "No song buffer ready to play")
+    (var generation 0)
+    (atomic {
+        (def music-play-generation (+ music-play-generation 1))
+        (setq generation music-play-generation)
+        (def music-starting true)
+        (def current-song 0)
+        (def music-playing false)
+        (def music-active-tracks 0)
+        (foc-play-stop)
+        (loopforeach ch channels { (setix ch 1 0) })
     })
+    (sleep 0.05)
+    (atomic (if (music-generation-current generation) {
+        (if (or song-buf-0-ready song-buf-1-ready) {
+            (if song-buf-0-ready (ext-midi-open 0 song-buf-0))
+            (if song-buf-1-ready (ext-midi-open 1 song-buf-1))
+            (def music-active-tracks (+ (if song-buf-0-ready 1 0) (if song-buf-1-ready 2 0)))
+            (def music-t-start (systime))
+            (def current-song resident-song-number)
+            (def music-playing true)
+            (if song-buf-0-ready (spawn 200 play-midi-track 0 song-buf-0-vol song-buf-0-decay resident-song-number generation))
+            (if song-buf-1-ready (spawn 200 play-midi-track 1 song-buf-1-vol song-buf-1-decay resident-song-number generation))
+        } {
+            (print "No song buffer ready to play")
+        })
+        (def music-starting false)
+    }))
 })
 
 ; Axel F bypasses the streamed-buffer model — see the import comment at the
 ; top. Same shape as play-current-song, hardcoded to the package buffers.
 (defun play-axelf () {
-    (def current-song 0)
+    (var generation 0)
+    (atomic {
+        (def music-play-generation (+ music-play-generation 1))
+        (setq generation music-play-generation)
+        (def music-starting true)
+        (def current-song 0)
+        (def music-playing false)
+        (def music-active-tracks 0)
+        (foc-play-stop)
+        (loopforeach ch channels { (setix ch 1 0) })
+    })
     (sleep 0.05)
-    (ext-midi-open 0 song1-track0)
-    (ext-midi-open 1 song1-track1)
-    (def music-t-start (systime))
-    (def current-song axelf-song-number)
-    (spawn 200 play-midi-track 0 2 0.92 axelf-song-number)
-    (spawn 200 play-midi-track 1 1.0 0.92 axelf-song-number)
-    (def music-playing true)
+    (atomic (if (music-generation-current generation) {
+        (ext-midi-open 0 song1-track0)
+        (ext-midi-open 1 song1-track1)
+        (def music-active-tracks 3)
+        (def music-t-start (systime))
+        (def current-song axelf-song-number)
+        (def music-playing true)
+        (def music-starting false)
+        (spawn 200 play-midi-track 0 2 0.92 axelf-song-number generation)
+        (spawn 200 play-midi-track 1 1.0 0.92 axelf-song-number generation)
+    }))
 })
 
 ; ===== Music: song upload (streaming) =====
@@ -416,7 +474,7 @@
     } {
         ; The buffers about to be refilled may be mid-playback — stop first,
         ; or a play-midi-track thread would read them while they're rewritten.
-        (if music-playing (stop-music))
+        (if (or music-playing music-starting) (stop-music))
         ; A new song number clears BOTH track-ready flags, so a mono song
         ; doesn't inherit a stale second track from a previous song.
         (if (!= song-number resident-song-number) {
