@@ -10,6 +10,7 @@
 ; needs to be installed on the device.
 (import "pkg::midi_axelf_melody@://vesc_packages/lib_files/files.vescpkg" 'song1-track0)
 (import "pkg::midi_axelf_base@://vesc_packages/lib_files/files.vescpkg"   'song1-track1)
+; @pcm-sample-imports
 
 (def can-cnt 0)
 (def statusByte_1 0x00)
@@ -106,6 +107,7 @@
 ; Axel F's reserved song number — must match songs.json's "number" for the
 ; "Axel F" / "source": "builtin-package" entry on the music-service side.
 (def axelf-song-number 1)
+; @pcm-sample-config
 
 ; ===== Music control CAN IDs =====
 ; All in the 0x4E0-0x4EF range that the VESC firmware filter passes through
@@ -695,6 +697,8 @@
     }))
 })
 
+; @pcm-sample-functions
+
 ; ===== Music: song upload (streaming) =====
 ; Music_Upload_Begin (0x4EC) — starts a new track upload.
 ;   byte0 = song number, byte1 = track slot (0 melody/1 bass),
@@ -800,6 +804,7 @@
         (cond
             ((= cmd 0x00) (stop-music))
             ((= cmd axelf-song-number) (play-axelf))
+            ; @pcm-sample-dispatch
             ((= cmd resident-song-number) (play-current-song))
             (t (print (list "Music cmd" cmd "ignored: no matching resident song"))))
         (send-music-status)
@@ -1091,6 +1096,7 @@
 
     (load-native-lib midi)
     (ext-midi-init 2) ; 2 simultaneous MIDI parsers = max 2 tracks per song
+    ; @pcm-sample-init
     (engine-init)
 
     ; Sustain envelope for the music engine
