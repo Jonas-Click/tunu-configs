@@ -3,27 +3,31 @@
 tunu-flash.py - upload LispBM scripts to and run REPL commands on the tunu
 VESC motor controller over CAN, straight from the scooter's MDB. No BLE needed.
 
-The tunu ECU is a VESC (firmware 6.06, hardware "TUNU 606") sitting on the
-scooter CAN bus at 125 kbit/s with node id 70 (0x46). This script speaks the
-VESC CAN transport (raw SocketCAN, python3 stdlib only, no pip deps) so it runs
-directly on the MDB.
+TUNU is a VESC motor controller on the scooter CAN bus (125 kbit/s, default
+node 70 / 0x46). The CAN transport uses raw SocketCAN and the Python standard
+library, so the tool can run directly on the MDB.
 
-The VESC only answers while engine power is on. Every CAN subcommand except
-`engine` powers the engine on first, waits ~6 s for the VESC to appear, and
-turns it back off afterwards (even on failure). Use --no-engine to skip that
-if power is already on, or --keep-engine to leave it on. The vehicle stays
-locked and parked throughout; this never unlocks.
+The VESC only answers while ECU power is on. Unless --no-engine is supplied,
+CAN commands switch it on, wait about 6 seconds, then switch it off afterwards,
+including on failure. --keep-engine leaves it on; the previous power state is
+not detected. The engine command changes power directly, while build is offline.
+The tool does not unlock the vehicle or check that it is stationary and locked;
+check those conditions before powering the ECU or writing.
 
-Usage (copy to the MDB, e.g. scp to deep-blue:/data/, then run there):
+Usage (run CAN commands on the MDB):
 
     tunu-flash.py version                     query fw version / hw name
     tunu-flash.py repl "(get-vin)"            run one REPL expression, print reply
     tunu-flash.py stats                       lisp engine stats + global bindings
     tunu-flash.py read > current.lisp         read back the installed script
     tunu-flash.py read --blob > backup.blob   preserve source and all imports
-    tunu-flash.py build app.lisp -o app.img   build offline (see FLASHING.md)
-    tunu-flash.py write --image app.img       upload a validated, prebuilt image
+    tunu-flash.py build app.lisp -o app.img   build an image offline
+    tunu-flash.py build --blob backup.blob -o rollback.img
+                                               wrap a complete readback for rollback
     tunu-flash.py write app.lisp              resolve imports + upload + verify
+    tunu-flash.py write --image app.img       upload a validated, prebuilt image
+    tunu-flash.py write --image app.img --keep-output-disabled
+                                               leave the remaining 120 s inhibition
     tunu-flash.py output off [seconds]        disable app throttle output (default 120 s)
     tunu-flash.py output on                   re-enable app throttle output
     tunu-flash.py engine on|off               just toggle engine power via lsc
@@ -34,16 +38,34 @@ Common flags:
     --iface NAME    CAN interface (default can0)
     --timeout SEC   per-reply timeout (default 1.0)
     --no-engine     do not touch engine power (assume it is already on)
-    --keep-engine   leave the engine on afterwards (default restores prior state)
+    --keep-engine   leave the engine on afterwards (default switches it off)
+
+Imports for `build` and `write`:
+    --resource-root DIR  resolve :// paths beneath DIR; no download is performed
+    --import TAG=FILE    use a local raw file for a tag; repeat for each override
+
+Relative imports are resolved against the Lisp source directory. Package imports
+support pkg::member@package.vescpkg and pkg@package.vescpkg. For example:
+
+    tunu-flash.py build app.lisp -o app.img --resource-root /path/to/resources
+    tunu-flash.py build app.lisp -o app.img --import midi=/path/to/midi.bin
+
+Repeat --import for other tags, such as song1-track0 and song1-track1.
+
+The resource root must contain vesc_packages/ for ://vesc_packages/... paths.
+Overrides are raw file contents without an added terminator. Use a native MIDI
+library compatible with the target firmware. `read --blob` preserves all imports;
+plain `read` returns only Lisp source. See FLASHING.md for backup and upload steps.
 
 The `write` path first disables the app throttle output for 120 s via the
 REPL extension (app-disable-output), because the appconf runs app_to_use=5
 (ADC+UART): the physical throttle is live whenever the ECU is powered, and a
 twist during an upload would move the motor. Only then does it stop lisp
 (SET_RUNNING 0), erase, write the image in CRC-checked chunks, read it back to
-verify, and restart lisp (SET_RUNNING 1), finishing with (app-disable-output 0)
-to re-enable output. If that final REPL fails, output re-enables on its own
-when the 120 s window expires. The whole write aborts if the initial
+verify, and restart lisp (SET_RUNNING 1). Unless --keep-output-disabled is set,
+it then requests (app-disable-output 0) to re-enable output. If re-enabling
+fails, or inhibition is deliberately kept, it expires after the remaining
+portion of the 120 s window. The whole write aborts if the initial
 disable-output call does not confirm, or if the target does not answer a
 version query. The `output` subcommand exposes the same guard manually;
 app_disable_output lives in app.c, independent of the lisp engine, so it works
