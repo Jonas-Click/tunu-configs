@@ -71,6 +71,7 @@ PRELUDE = r'''
 (defun foc-play-tone (channel frequency voltage) { (def tone-events (+ tone-events 1)) true })
 (defun foc-play-stop () { (def stop-events (+ stop-events 1)) true })
 (defun send-music-status () { (def song-status-events (+ song-status-events 1)) true })
+(defun engine-pause () true)
 (defun mock-midi-open (slot data) {
     (setix parse-offsets slot 0)
     (setix parser-generations slot music-play-generation)

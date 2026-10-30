@@ -1,15 +1,12 @@
 ; ===== MIDI imports — must appear before any executable code =====
 (import "pkg::midi@://vesc_packages/lib_midi/midi.vescpkg" 'midi)
 
-; Axel F is imported from vesc_tool's built-in stock lib_files package (works
-; because vesc_tool resolves :// imports from its OWN resources). It's the
-; one song kept special-cased: every OTHER song arrives over CAN from
-; music-service immediately before it plays, so app.lisp holds no embedded
-; melody content at all — Axel F is a package reference resolved by
-; vesc_tool itself, so there's nothing to stream for it. No custom package
-; needs to be installed on the device.
+; Axel F is imported from vesc_tool's built-in stock lib_files package.
 (import "pkg::midi_axelf_melody@://vesc_packages/lib_files/files.vescpkg" 'song1-track0)
 (import "pkg::midi_axelf_base@://vesc_packages/lib_files/files.vescpkg"   'song1-track1)
+; Private sample imports are added only to the generated sample-playback build.
+; @private-warp-imports
+; @boost-native-imports
 
 (def can-cnt 0)
 (def statusByte_1 0x00)
@@ -20,7 +17,7 @@
 (def motor-power-kw 0x03)
 (def max-speed-kmh 0x45)
 (def sw-base-version 0x10)  ; "1.0"
-(def sw-app-version 1)
+(def sw-app-version 4)
 
 (def pole-pairs 24.0)
 
@@ -83,6 +80,46 @@
 (def shutdown-threshold 2.48)
 (def shutdown-triggered false)
 
+; The optional native guard owns boost expiry independently of the Lisp evaluator.
+(def boost-native-enabled false)
+(def boost-policy-enabled false)
+(def boost-per-pack-amps 85.0)
+(def boost-duration-seconds 10.0)
+(def boost-cooldown-seconds 90.0)
+(def boost-heartbeat-ms 250)
+(def boost-supply-ms 3000)
+(def boost-release-ms 100)
+(def boost-runtime-ready false)
+(def boost-control-byte 1)
+
+(defun boost-start () {
+    (def boost-runtime-ready false)
+    (def boost-control-byte 1)
+    (if (and boost-native-enabled boost-policy-enabled)
+        (match (trap (progn
+            (load-native-lib boost-guard-lib)
+            (and (= (ext-boost-api) 1)
+                 (ext-boost-config boost-per-pack-amps boost-duration-seconds
+                                   boost-cooldown-seconds boost-heartbeat-ms boost-supply-ms boost-release-ms))))
+            ((exit-ok (? ready)) (def boost-runtime-ready ready))
+            (_ (print "Boost unavailable; normal limits retained"))))
+})
+
+(defun boost-tick () {
+    (if boost-runtime-ready
+        (if (not (ext-boost-heartbeat boost-control-byte (if (drive-requested) 1 0)))
+            (def boost-runtime-ready false)))
+})
+
+(defun boost-normal-current ()
+    (if boost-runtime-ready (ext-boost-normal-current) (conf-get 'l-in-current-max)))
+
+(defun boost-set-normal-current (amps packs)
+    (and boost-runtime-ready (ext-boost-normal amps packs)))
+
+(defun boost-supply-lease (packs normal-amps)
+    (and boost-runtime-ready (ext-boost-supply packs normal-amps)))
+
 ; ===== Music: streamed song buffers =====
 ; music-service streams a song's decoded MIDI bytes over CAN
 ; (Music_Upload_Begin/Chunk/End, below) immediately before playing it, into
@@ -106,14 +143,15 @@
 ; Axel F's reserved song number — must match songs.json's "number" for the
 ; "Axel F" / "source": "builtin-package" entry on the music-service side.
 (def axelf-song-number 1)
+; @private-warp-config
 
 ; ===== Music control CAN IDs =====
-; All in the 0x4E0-0x4EF range that the VESC firmware filter passes through
-; to LispBM. ecu-service only uses 0x4E0/0x4E1/0x4E2/0x4EB/0x4EF, so the IDs
-; below are free for music control:
+; These extension messages share the 0x4E0-0x4EF range passed to LispBM.
+; Music uses the following IDs in that block:
 ;
 ;   Music_Control_ID1     0x4E8  play/stop     byte0: 0x00 stop, N = play song N
 ;   Music_Control_ID2     0x4E9  master volume byte0: 0..100 (percent, live)
+;   Engine_Sound          0x4EA  off/on/demo, volume percent, style 0..4
 ;   Music_Upload_Begin    0x4EC  starts a track upload (see handle-upload-begin)
 ;   Music_Upload_Chunk    0x4ED  one chunk of a track upload (up to 7 bytes)
 ;   Music_Upload_End      0x4EE  ends a track upload, length+checksum validated
@@ -135,6 +173,7 @@
 
 ; Build and send ECU_status4 (0x7E3) reflecting current KERS state
 (defun send-status4 (ebs-en gear-en) {
+    (if (and boost-runtime-ready (ext-boost-report)) nil {
     (var status-byte 0)
     (setq status-byte (bitwise-or status-byte 0x01))           ; ecu_is_enabled = 1
                                                                  ; ecu_is_disabled = 0 (bit 1)
@@ -150,6 +189,7 @@
     )
     (bufset-u8 dataArray_0x7E3 0 status-byte)
     (can-send-sid 0x7E3 dataArray_0x7E3)
+    })
 })
 
 ; Send ECU_ebs_get (0x7E5) echoing back current KERS parameters
@@ -202,10 +242,7 @@
 ;   byte 1   = reserved
 ;   bytes 2-5 = fault code (u32, big-endian)
 (defun send-status2 () {
-    ; No FET temperature sensor on this controller: get-temp-fet reads a
-    ; floating ADC and climbs into triple digits. Pin a plausible ambient
-    ; 25 °C instead of 0, which still reads as freezing to consumers.
-    (bufset-i8 dataArray_0x7E1 0 25)
+    (bufset-i8 dataArray_0x7E1 0 (to-i (get-temp-fet)))
     (bufset-u8 dataArray_0x7E1 1 0)
     (bufset-u32 dataArray_0x7E1 2 (map-vesc-fault (get-fault)))
     (can-send-sid 0x7E1 dataArray_0x7E1)
@@ -261,19 +298,259 @@
 (def num-chan 4)
 ; current-song is the stop/switch signal AND the number echoed on 0x7E6:
 ;   0     = stopped  — track threads exit their loops when they see this
-;   N>0   = playing song N; generations distinguish same-song replays
+;   N>0   = playing song N; generation tokens also distinguish same-song replays
 (def music-playing false)
 (def current-song 0)
 (def music-t-start (systime))
 (def music-play-generation 0)
 (def music-active-tracks 0)
 (def music-starting false)
+(def music-upload-last -100.0)
+
+(def engine-enabled false)
+(def engine-volume 50)
+(def engine-style 0)
+(def engine-demo-playing false)
+(def engine-demo-start 0.0)
+(def engine-start-pending false)
+; Cue state: 0 steady, 1 starting, 2 stopping.
+(def engine-cue 0)
+(def engine-cue-start 0.0)
+(def engine-owned false)
+(def engine-rpm 0.0)
+(def engine-gain 0.0)
+(def engine-last-step 0.0)
+(def engine-last-status 0.0)
+(def engine-model-speed 0.0)
+(def engine-model-throttle 0.0)
+(def engine-model-brake 0.0)
+(def engine-wobble-phase 0.0)
+(def engine-tone-voltage 1.0)
+(def engine-demo-seconds 30.0)
 
 ; Music functions live in flash (@const-start/@const-end), not the RAM cell
 ; heap: upstream alone already fills about half the heap, and the music code
 ; on top of it ran the heap out. Only function definitions go in const
 ; blocks — anything mutated at runtime (channels, flags, buffers) stays in RAM.
 @const-start
+
+; Engine tones share the four audio channels with MIDI and sampled playback.
+; Only the audio owner may write them; songs reserve ownership before yielding.
+(defun engine-clamp (value low high)
+    (if (< value low) low (if (> value high) high value)))
+
+(defun engine-profile (style)
+    (cond
+        ((= style 1) '(1800.0 280.0 8800.0 (2.0 4.0 6.0 9.0) (0.885 0.442 0.147 0.0)))
+        ((= style 2) '(1600.0 350.0 11500.0 (4.0 8.0 12.0 16.0) (0.873 0.444 0.190 0.079)))
+        ((= style 3) '(950.0 180.0 5200.0 (3.0 4.5 7.5 10.5) (0.958 0.260 0.123 0.027)))
+        ((= style 4) '(1000.0 180.0 8000.0 (9.0 18.0 27.0 36.0) (0.965 0.241 0.096 0.024)))
+        (t '(1100.0 220.0 6200.0 (4.0 8.0 12.0 16.0) (0.884 0.402 0.225 0.096)))))
+
+(defun engine-pause () {
+    (if engine-owned {
+        (looprange channel 0 4 { (foc-play-tone channel 500.0 0.0) })
+        (def engine-owned false)
+    })
+    (def engine-gain 0.0)
+})
+
+(defun engine-init () {
+    (foc-play-stop)
+    (def engine-enabled false)
+    (def engine-volume 50)
+    (def engine-style 0)
+    (def engine-demo-playing false)
+    (def engine-start-pending false)
+    (def engine-cue 0)
+    (def engine-owned false)
+    (def engine-rpm 0.0)
+    (def engine-gain 0.0)
+    (def engine-wobble-phase 0.0)
+    (def engine-last-step (systime))
+    (def engine-last-status (systime))
+    (def music-play-generation 0)
+    (def music-active-tracks 0)
+    (def music-starting false)
+    (def music-playing false)
+    (def current-song 0)
+    (def music-upload-last -100.0)
+})
+
+(defun send-engine-status-locked () {
+    (bufset-u8 dataArray_0x7ED 0 (if engine-enabled 1 0))
+    (bufset-u8 dataArray_0x7ED 1 engine-volume)
+    (bufset-u8 dataArray_0x7ED 2 (if engine-demo-playing 1 0))
+    (bufset-u8 dataArray_0x7ED 3 engine-style)
+    (can-send-sid 0x7ED dataArray_0x7ED)
+    (def engine-last-status (systime))
+})
+
+(defun send-engine-status () (atomic (send-engine-status-locked)))
+
+(defun handle-engine-command (data) {
+    (if (>= (buflen data) 2) {
+        (var command (bufget-u8 data 0))
+        (var volume (engine-clamp (bufget-u8 data 1) 0 100))
+        (var style (if (>= (buflen data) 3) (bufget-u8 data 2) engine-style))
+        (if (and (<= command 2) (<= style 4))
+            (atomic {
+                (def engine-volume volume)
+                (def engine-style style)
+                (cond
+                    ((= command 0) {
+                        (var stop-cue (and engine-enabled engine-owned (not engine-demo-playing)))
+                        (def engine-enabled false)
+                        (def engine-demo-playing false)
+                        (def engine-start-pending false)
+                        (if stop-cue {
+                            (def engine-cue 2)
+                            (def engine-cue-start (systime))
+                        } {
+                            (def engine-cue 0)
+                            (engine-pause)
+                        })
+                    })
+                    ((= command 1) {
+                        (if (and (not engine-enabled) (not engine-demo-playing)) {
+                            (def engine-start-pending true)
+                            (def engine-cue 0)
+                        })
+                        (def engine-enabled true)
+                    })
+                    ((= command 2) {
+                        (if (not engine-demo-playing) {
+                            (def engine-demo-playing true)
+                            (def engine-demo-start (systime))
+                            (if (not engine-owned) (def engine-start-pending true))
+                            (def engine-cue 0)
+                        })
+                    })
+                )
+            }))
+    })
+    (send-engine-status)
+})
+
+; Demo inputs affect synthesis only, never ADC commands, RPM or vehicle state.
+(defun engine-demo-input (age) {
+    (def engine-model-speed 0.0)
+    (def engine-model-throttle 0.0)
+    (def engine-model-brake 0.0)
+    (cond
+        ((< age 1.0) nil)
+        ((< age 10.0) {
+            (def engine-model-speed (* 5.0 (- age 1.0)))
+            (def engine-model-throttle 0.85)
+        })
+        ((< age 14.0) {
+            (def engine-model-speed 45.0)
+            (def engine-model-throttle 0.2)
+        })
+        ((< age 20.0) {
+            (def engine-model-speed (* 45.0 (- 1.0 (/ (- age 14.0) 6.0))))
+            (def engine-model-brake 0.5)
+        })
+        ((< age 27.0) {
+            (def engine-model-throttle (+ 0.5 (* 0.5 (sin (* (- age 20.0) 3.0)))))
+            (def engine-model-brake 1.0)
+        })
+    )
+})
+
+(defun engine-target-rpm (profile speed throttle brake) {
+    (var ratio (cond ((< speed 10.0) 1.0) ((< speed 23.0) 0.72)
+                     ((< speed 36.0) 0.52) ((< speed 50.0) 0.40) (t 0.32)))
+    (var idle (ix profile 0))
+    (var limit (ix profile 2))
+    (var target (+ idle (* speed (ix profile 1) ratio) (* throttle 600.0)))
+    (if (and (< speed 1.0) (> brake 0.2))
+        (setq target (+ idle (* throttle (- limit idle) 0.8))))
+    (engine-clamp target idle limit)
+})
+
+(defun engine-step ()
+    (atomic {
+        (var now (systime))
+        (var dt (engine-clamp (secs-since engine-last-step) 0.0 0.1))
+        (def engine-last-step now)
+        (if (and engine-demo-playing (>= (secs-since engine-demo-start) engine-demo-seconds)) {
+            (def engine-demo-playing false)
+            (if (not engine-enabled) {
+                (def engine-start-pending false)
+                (def engine-cue (if engine-owned 2 0))
+                (def engine-cue-start now)
+            })
+            (send-engine-status-locked)
+        })
+        (if (or music-playing music-starting (< (secs-since music-upload-last) 0.3)
+                (!= (get-fault) 0)) {
+            (engine-pause)
+        } {
+            (if (and engine-start-pending (or engine-enabled engine-demo-playing)) {
+                (def engine-start-pending false)
+                (def engine-cue 1)
+                (def engine-cue-start now)
+            })
+            (if (and (= engine-cue 1) (>= (secs-since engine-cue-start) 0.65))
+                (def engine-cue 0))
+            (if (and (= engine-cue 2) (>= (secs-since engine-cue-start) 0.35))
+                (def engine-cue 0))
+            (if (or engine-enabled engine-demo-playing (= engine-cue 2)) {
+                (var profile (engine-profile engine-style))
+                (def engine-model-speed (abs (/ (* (get-speed) 3.6) speed-cal)))
+                (def engine-model-throttle (engine-clamp (get-adc-decoded 0) 0.0 1.0))
+                (def engine-model-brake (engine-clamp (get-adc-decoded 1) 0.0 1.0))
+                (if engine-demo-playing (engine-demo-input (secs-since engine-demo-start)))
+                (var target (engine-target-rpm profile engine-model-speed engine-model-throttle engine-model-brake))
+                (var level (* (/ (to-float engine-volume) 100.0)
+                              (+ 0.45 (* 0.55 engine-model-throttle))))
+                (var cue-age (secs-since engine-cue-start))
+                (if (= engine-cue 1) {
+                    (var factor (cond
+                        ((< cue-age 0.2) (+ 0.35 (* 3.25 cue-age)))
+                        ((< cue-age 0.4) (+ 1.0 (* 4.5 (- cue-age 0.2))))
+                        (t (- 1.9 (* 3.6 (- cue-age 0.4))))))
+                    (if (= engine-style 1)
+                        (setq factor (+ 0.45 (* 1.4 (abs (sin (* cue-age 10.0)))))))
+                    (setq target (* (ix profile 0) factor))
+                    (setq level (* (/ (to-float engine-volume) 100.0) 0.75))
+                })
+                (if (= engine-cue 2) {
+                    (var remaining (engine-clamp (- 1.0 (/ cue-age 0.35)) 0.0 1.0))
+                    (setq target (* engine-rpm remaining))
+                    (setq level (* (/ (to-float engine-volume) 100.0) 0.45 remaining))
+                })
+                (def engine-rpm (+ engine-rpm (engine-clamp (- target engine-rpm) (* -9000.0 dt) (* 9000.0 dt))))
+                (def engine-gain (+ engine-gain (engine-clamp (- level engine-gain) (* -5.0 dt) (* 5.0 dt))))
+                (def engine-wobble-phase (+ engine-wobble-phase (* dt (if (= engine-style 3) 29.0 43.0))))
+                (if (>= engine-wobble-phase 6.2831853)
+                    (def engine-wobble-phase (- engine-wobble-phase 6.2831853)))
+                (var wobble (+ 1.0 (* 0.015 (sin engine-wobble-phase))))
+                (looprange channel 0 4 {
+                    (var frequency (engine-clamp (* (/ engine-rpm 60.0) (ix (ix profile 3) channel) wobble) 70.0 5000.0))
+                    (var voltage (* engine-tone-voltage engine-gain (ix (ix profile 4) channel)))
+                    (foc-play-tone channel frequency voltage)
+                })
+                (def engine-owned true)
+            } {
+                (engine-pause)
+            })
+        })
+        (if (>= (secs-since engine-last-status) 1.0) (send-engine-status-locked))
+    }))
+
+(defun engine-loop () {
+    (var result (trap (loopwhile t { (engine-step) (sleep 0.02) })))
+    (atomic {
+        (engine-pause)
+        (def engine-enabled false)
+        (def engine-demo-playing false)
+        (def engine-cue 0)
+    })
+    (send-engine-status)
+    (print (list "Engine sound stopped" result))
+})
 
 (defun advance-music-generation ()
     (atomic {
@@ -345,7 +622,7 @@
 
 ; ===== Music: playback =====
 
-; Both the song and generation must still own playback.
+; The song and generation are captured at spawn time; both must still own playback.
 (defun play-midi-track (parser-idx volts decay song-id generation) {
     (var t-delta 0.0)
     (var midi-tdiv 100)
@@ -387,9 +664,9 @@
     (music-track-finished generation parser-idx)
 })
 
-(defun stop-music ()
-    (atomic {
-        (def music-play-generation (+ music-play-generation 1))
+(defun stop-music () {
+    (var generation (advance-music-generation))
+    (atomic (if (music-generation-current generation) {
         (def current-song 0)
         (def music-playing false)
         (def music-starting false)
@@ -397,18 +674,20 @@
         (foc-play-stop)
         (loopforeach ch channels { (setix ch 1 0) })
     }))
+})
+
+; @private-warp-functions
 
 ; Plays whatever's currently loaded in song-buf-0/1, according to which track
 ; slots handle-upload-end has marked ready.
 (defun play-current-song () {
-    (var generation 0)
+    (var generation (advance-music-generation))
     (atomic {
-        (def music-play-generation (+ music-play-generation 1))
-        (setq generation music-play-generation)
         (def music-starting true)
         (def current-song 0)
         (def music-playing false)
         (def music-active-tracks 0)
+        (engine-pause)
         (foc-play-stop)
         (loopforeach ch channels { (setix ch 1 0) })
     })
@@ -433,14 +712,13 @@
 ; Axel F bypasses the streamed-buffer model — see the import comment at the
 ; top. Same shape as play-current-song, hardcoded to the package buffers.
 (defun play-axelf () {
-    (var generation 0)
+    (var generation (advance-music-generation))
     (atomic {
-        (def music-play-generation (+ music-play-generation 1))
-        (setq generation music-play-generation)
         (def music-starting true)
         (def current-song 0)
         (def music-playing false)
         (def music-active-tracks 0)
+        (engine-pause)
         (foc-play-stop)
         (loopforeach ch channels { (setix ch 1 0) })
     })
@@ -463,6 +741,8 @@
 ;   byte0 = song number, byte1 = track slot (0 melody/1 bass),
 ;   byte2-3 = length LE u16, byte4 = volume x10, byte5 = decay x100
 (defun handle-upload-begin (data) {
+    (def music-upload-last (systime))
+    (engine-pause)
     (var song-number (bufget-u8 data 0))
     (var track-slot  (bufget-u8 data 1))
     (var track-len (+ (bufget-u8 data 2) (* (bufget-u8 data 3) 256)))
@@ -503,6 +783,7 @@
 ; are appended in arrival order), byte1-7 = up to 7 bytes.
 (defun handle-upload-chunk (data) {
     (if (and (>= upload-active-slot 0) (> (buflen data) 1)) {
+        (def music-upload-last (systime))
         (var n (- (buflen data) 1))
         (var dst (if (= upload-active-slot 0) song-buf-0 song-buf-1))
         (looprange i 0 n {
@@ -521,6 +802,7 @@
 ; success, marks that track slot ready to play. On failure music-service
 ; retries the whole track from Begin.
 (defun handle-upload-end (data) {
+    (def music-upload-last (systime))
     (var song-number (bufget-u8 data 0))
     (var track-slot  (bufget-u8 data 1))
     (var checksum    (bufget-u8 data 2))
@@ -559,10 +841,13 @@
         (cond
             ((= cmd 0x00) (stop-music))
             ((= cmd axelf-song-number) (play-axelf))
+            ; @private-warp-dispatch
             ((= cmd resident-song-number) (play-current-song))
             (t (print (list "Music cmd" cmd "ignored: no matching resident song"))))
         (send-music-status)
     })
+
+    (if (= id 0x4EAu32) (handle-engine-command data))
 
     ; Music_Control_ID2 (0x4E9) - master volume
     ; 4E9#<0..100 in hex>  (e.g. 4E9#50 = 80%)
@@ -590,6 +875,8 @@
         (var gear-en  (bitwise-and ctrl-byte 0x01))
         (var boost-en (shr (bitwise-and ctrl-byte 0x02) 1))
         (var ebs-en   (shr (bitwise-and ctrl-byte 0x04) 2))
+        (def boost-control-byte (bitwise-and ctrl-byte 7))
+        (boost-tick)
 
         (def kers-enabled (= ebs-en 1))
         (print (list "KERS:" kers-enabled "gear:" gear-en "boost:" boost-en))
@@ -642,6 +929,7 @@
         (send-config-block)
         (sleep 0.01)
         (send-music-status)
+        (send-engine-status)
     })
 
     ; Control_Message_ID1 (0x4EB) - Speed limit ratio
@@ -818,12 +1106,14 @@
     (def dataArray_0x7EA (array-create 2))
     (def dataArray_0x7EB (array-create 1))
     (def dataArray_0x7EC (array-create 1))
+    (def dataArray_0x7ED (array-create 4))
     (def dataArray_0x7EE (array-create 2))
     (def dataArray_0x7EF (array-create 2))
 
     (def song-buf-0 (array-create song-buf-max))  ; track slot 0: melody
     (def song-buf-1 (array-create song-buf-max))  ; track slot 1: bass
     (def channels (map (fn (x) (list x 0 0 0 0)) (range num-chan)))
+    ; @private-warp-init
 
     ; The VESC keeps its config while powered, so after a lisp restart the limits
     ; would hold stale values (e.g. a regen limit armed by a handshake that the
@@ -846,9 +1136,12 @@
 
     (load-native-lib midi)
     (ext-midi-init 2) ; 2 simultaneous MIDI parsers = max 2 tracks per song
+    (engine-init)
+    (boost-start)
 
     ; Sustain envelope for the music engine
     (spawn 200 decay-loop)
+    (spawn 300 engine-loop)
 
     ; Spawn the event handler thread and pass the ID it returns to C
     (event-register-handler (spawn 150 event-handler))
@@ -882,6 +1175,7 @@
     ; clear the fault.
     (loopwhile t {
         (check-shutdown)
+        (boost-tick)
         (update-kers-fade)
         (update-kers-current)
         (if (= (mod tick 40) 0) {
@@ -900,7 +1194,7 @@
 ; next, which a previous boot may already have filled differently ("already
 ; occupied") and kills the calling thread. Touch every such helper the code
 ; uses at runtime now, so they are baked into the image instead.
-(list abs loopforeach looprange loopwhile)
+(list abs sin loopforeach looprange loopwhile)
 
 (image-save)
 

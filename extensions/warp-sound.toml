@@ -1,0 +1,19 @@
+[[rule]]
+name = "tunu-warp-sound"
+enabled = false
+on = ["input.warp-speed"]
+concurrency = "drop"
+
+  [[rule.input]]
+  hash = "engine-ecu"
+  fields = ["speed"]
+  topic = "input.warp-speed"
+
+  [[rule.input]]
+  hash = "vehicle"
+  fields = ["state"]
+
+  [[rule.step]]
+  do = "exec"
+  command = "/data/extensions/warp-sound.py"
+  timeout = "5s"
