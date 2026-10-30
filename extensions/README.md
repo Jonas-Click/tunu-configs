@@ -2,7 +2,7 @@
 
 `warp-sound.toml` is deliberately disabled. It observes `engine-ecu.speed`; `warp-sound.py` requires a recent speed event whose `from` matches its own prior speed observation and whose prior observation is no more than one second old. It also checks the current speed and `vehicle.state`, drops concurrent work instead of queueing it, rearms at or below 45 km/h, and enforces a 45-second cooldown. Timestamps measure event-service observation emission age, not ECU acquisition age. The helper stores its baseline and latch under `tunu:warp-sound:trigger-state`, outside vehicle hashes.
 
-The generic `app.lisp` keeps sample playback disabled, imports no private audio, and does not reserve song 7. Only the locally generated private app image injects the `foc-play-samples` player, sample imports and song-7 dispatch. It sends no PCM over CAN. The waveform, generated app and staged bundle remain private and are not distributed here.
+The generic `app.lisp` keeps sample playback disabled and imports no private audio. Only the generated private app image injects the `foc-play-samples` player, sample imports and dispatch. New builds default to song 240; the staged trigger uses the same selected number. It sends no PCM over CAN. The waveform, generated app and staged bundle remain private and are not distributed here.
 
 The helper invalidates its baseline and arming after stale, out-of-order, mismatched or invalid observations, so a crossing needs a recent matching predecessor observed by this helper. This bounds the observation chain but cannot identify a reconnect that occurs within the one-second window. Keep the rule disabled until deployment review confirms event continuity and target runtime behavior.
 

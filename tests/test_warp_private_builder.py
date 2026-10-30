@@ -33,7 +33,7 @@ class PrivateBuilderTests(unittest.TestCase):
             r'\(import "samples/warp-sample-(\d+)\.s8" \'warp-sample-\d+\)', source)
         self.assertEqual(sorted(map(int, imports)), list(range(12)))
         self.assertIn("(def warp-samples-enabled true)", source)
-        self.assertIn("(def warp-song-number 7)", source)
+        self.assertIn("(def warp-song-number 240)", source)
         self.assertIn("(def music-play-generation 0)", source)
         self.assertIn("((and warp-samples-enabled (= cmd warp-song-number))", source)
         self.assertNotIn("@private-warp-", source)
@@ -50,17 +50,45 @@ class PrivateBuilderTests(unittest.TestCase):
                       builder.PRIVATE_FUNCTIONS["play-axelf"])
 
     def test_existing_sample_catalog_entry_is_preserved(self):
-        existing = {"number": 7, "name": "Space Whoosh", "source": "builtin-samples", "default": "tng-warp2"}
+        existing = {"number": 240, "name": "Space Whoosh", "source": "builtin-samples", "default": "tng-warp2"}
         base = [{"number": 1, "name": "Axel F"}, existing]
         self.assertEqual(builder.stage_catalog(base), base)
         self.assertEqual(base[1], existing)
         self.assertEqual(builder.stage_catalog([base[0]])[-1], builder.ENTRY)
         with self.assertRaisesRegex(ValueError, "not a resident sample"):
-            builder.stage_catalog([{"number": 7, "name": "other", "tracks": [{"file": "a"}]}])
+            builder.stage_catalog([{"number": 240, "name": "other", "tracks": [{"file": "a"}]}])
         with self.assertRaisesRegex(ValueError, "more than once"):
             builder.stage_catalog([existing, existing])
         with self.assertRaisesRegex(ValueError, "not a resident sample"):
-            builder.stage_catalog([{"number": 7, "source": "builtin-samples", "tracks": [{"file": "a"}]}])
+            builder.stage_catalog([{"number": 240, "source": "builtin-samples", "tracks": [{"file": "a"}]}])
+
+    def test_explicit_legacy_migration_and_custom_sample_number(self):
+        legacy = {"number": 7, "name": "TNG Warp 2", "source": "builtin-samples", "default": "tng-warp2"}
+        with self.assertRaisesRegex(ValueError, 'legacy sample at 7'):
+            builder.stage_catalog([legacy])
+        moved = builder.stage_catalog([legacy], 255, migrate_legacy=True)
+        self.assertEqual(moved, [dict(legacy, number=255)])
+        self.assertEqual(legacy['number'], 7)
+        with self.assertRaisesRegex(ValueError, 'already in use'):
+            builder.stage_catalog([legacy, {'number': 240}], migrate_legacy=True)
+        for number in (0, 7, 239, 256):
+            with self.assertRaisesRegex(ValueError, '240-255'):
+                builder.injected_app(self.default_source, number)
+        self.assertIn('(def warp-song-number 255)', builder.injected_app(self.default_source, 255))
+
+    def test_upgrade_existing_pcm_preserves_target_and_applies_merged_upload_fix(self):
+        original = builder.injected_app(self.default_source).replace('(def warp-song-number 240)', '(def warp-song-number 7)')
+        original = original.replace('(if (or music-playing music-starting) (stop-music))', '(if music-playing (stop-music))')
+        original = original.replace('(def shutdown-threshold 2.48)', '(def shutdown-threshold 2.50)')
+        updated = builder.upgrade_existing_app(original, 240)
+        self.assertIn('(def warp-song-number 240)', updated)
+        self.assertIn('(def shutdown-threshold 2.50)', updated)
+        self.assertIn('(if (or music-playing music-starting) (stop-music))', updated)
+        self.assertEqual(builder.extract_defun(original, 'check-shutdown'), builder.extract_defun(updated, 'check-shutdown'))
+        with self.assertRaisesRegex(ValueError, 'enabled resident sample'):
+            builder.upgrade_existing_app(self.default_source, 240)
+        with self.assertRaisesRegex(ValueError, 'song number'):
+            builder.upgrade_existing_app(original, 239)
 
     def test_custom_target_logic_is_preserved_and_music_mismatch_rejected(self):
         custom = self.default_source.replace('(def shutdown-threshold 2.48)', '(def shutdown-threshold 2.50)')
