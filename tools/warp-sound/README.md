@@ -2,6 +2,34 @@
 
 The repository contains reusable conversion and opt-in build tools, not a recording or captured VESC package binaries. Normal app builds and tests need none of the private inputs or FFmpeg. Keep supplied audio, converted samples, native resource backups, catalogues containing private entries, and generated bundles outside Git. No project-wide license or redistribution permission for a supplied recording is implied.
 
+## Quick start
+
+Run from the repository root on the MDB, with the ECU already safely powered, the vehicle stationary and locked, and OTA idle. Set `SAMPLE` to a signed 8-bit mono 16 kHz PCM file with exactly 44,160 bytes. The controller must already have compatible native MIDI imports.
+
+```sh
+SAMPLE=/path/to/sample.s8
+WORK="/data/tunu-pcm-$(date +%s)"; mkdir -m 700 "$WORK"
+
+python3 tunu-flash.py --no-engine read --backup-dir "$WORK/backup"
+
+python3 tools/warp-sound/build_private.py \
+  --app-source "$WORK/backup/before.lisp" \
+  --resource-backup "$WORK/backup" \
+  --sample-stream "$SAMPLE" \
+  --base-catalog /data/music-service/songs.json \
+  --output-dir "$WORK/build"
+
+python3 tunu-flash.py --no-engine write \
+  --image "$WORK/build/bundle/vesc/warp-sample.img" \
+  --keep-output-disabled
+
+cp -p /data/music-service/songs.json "$WORK/songs.before.json"
+cp "$WORK/build/bundle/music-service/songs.json" /data/music-service/songs.json
+systemctl restart music-service
+```
+
+The backup contains the original Lisp source, all imports and a rollback image. The builder rejects incompatible source hooks, changed shared music functions, missing resources and a conflicting song 7; it does not overwrite the input source or catalogue. Review the generated source before uploading. Output inhibition expires after 120 seconds, so check controller faults, settings, odometer and a cold-boot readback before returning the vehicle to use. If rolling back, upload `$WORK/backup/rollback.img` and restore `$WORK/songs.before.json`. The event-trigger extension remains disabled until explicitly configured.
+
 ## Requirements
 
 - Python 3 with its standard library.
