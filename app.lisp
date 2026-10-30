@@ -754,7 +754,7 @@
     } {
         ; The buffers about to be refilled may be mid-playback — stop first,
         ; or a play-midi-track thread would read them while they're rewritten.
-        (if music-playing (stop-music))
+        (if (or music-playing music-starting) (stop-music))
         ; A new song number clears BOTH track-ready flags, so a mono song
         ; doesn't inherit a stale second track from a previous song.
         (if (!= song-number resident-song-number) {
