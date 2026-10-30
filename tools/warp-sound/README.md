@@ -55,13 +55,14 @@ python3 tools/warp-sound/build_private.py \
   --sample-stream "$PRIVATE_OUTPUT/warp-sound-16000.s8" \
   --sample-sha256 "$EXPECTED_SAMPLE_SHA256" \
   --resource-backup "$RESOURCE_BACKUP" \
+  --app-source "$RESOURCE_BACKUP/before.lisp" \
   --base-catalog "$BASE_CATALOG" \
   --output-dir "$PRIVATE_OUTPUT"
 ```
 
 Alternatively, use `--source-audio "$SOURCE_AUDIO"` instead of `--sample-stream` to convert during the build. The expected digest is optional for the builder; when omitted, it prints the converted sample digest. `--sample-sha256` verifies a previously recorded digest.
 
-The builder preserves an existing song 7 if it is a trackless `builtin-samples` entry, including its name and other fields. If song 7 is used for anything else, it refuses to overwrite it. If song 7 is absent, it adds the sample entry unless its name is already used elsewhere. It injects sample imports/player/dispatch only into the generated app, separately builds the generic app without sample files, validates preserved resources against metadata, checks image imports including their NUL terminators, and enforces VESC image capacity. It writes the preview, sample chunks, app image/source, staged catalogue, and disabled event extension only to the selected private output directory. It never writes to a vehicle. The generated image uses the repository's generic `app.lisp`, not the captured `before.lisp`. Compare and preserve target-specific shutdown, temperature, calibration, odometer and other behavior before considering an upload; do not replace a customized app blindly.
+The builder preserves an existing song 7 if it is a trackless `builtin-samples` entry, including its name and other fields. If song 7 is used for anything else, it refuses to overwrite it. If song 7 is absent, it adds the sample entry unless its name is already used elsewhere. It injects sample imports/player/dispatch only into the generated app, separately builds the generic app without sample files, validates preserved resources against metadata, checks image imports including their NUL terminators, and enforces VESC image capacity. It writes the preview, sample chunks, app image/source, staged catalogue, and disabled event extension only to the selected private output directory. It never writes to a vehicle. `--app-source` uses the captured target source instead of the generic repository app. The source must contain all PCM insertion points and its shared music functions must match the reviewed repository implementation; otherwise the builder refuses to continue. All imports in the source must be present in the backup and match its recorded hashes. Already-sampled images and incompatible custom music code need separate review. Without `--app-source`, the builder uses the generic repository app; do not use that default to replace a customized target blindly.
 
 ## Offline checks
 

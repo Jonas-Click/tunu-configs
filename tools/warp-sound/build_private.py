@@ -15,12 +15,6 @@ SONG_ID = 7
 ENTRY = {"number": SONG_ID, "name": "TNG Warp 2", "source": "builtin-samples"}
 SAMPLE_BYTES = 44160
 CHUNK_BYTES = 4000
-RESOURCE_FILES = {
-    "midi": "installed-midi.bin",
-    "song1-track0": "installed-song1-track0.bin",
-    "song1-track1": "installed-song1-track1.bin",
-}
-
 IMPORTS = "\n".join(
     '(import "samples/warp-sample-%d.s8" \'warp-sample-%d)' % (i, i)
     for i in range(12)
@@ -210,12 +204,13 @@ PRIVATE_FUNCTIONS = {name: extract_defun((REPO / 'app.lisp').read_text(), name)
 
 
 def injected_app(source):
+    for name, snippet in PRIVATE_FUNCTIONS.items():
+        if extract_defun(source, name) != snippet:
+            raise ValueError("target music function differs from reviewed source: " + name)
     for marker, snippet in MARKERS.items():
         if source.count(marker) != 1:
             raise ValueError("expected exactly one app injection point: " + marker)
         source = source.replace(marker, snippet)
-    for name, snippet in PRIVATE_FUNCTIONS.items():
-        source = replace_defun(source, name, snippet)
     return source
 
 
@@ -256,19 +251,27 @@ def prepare_private_output(path):
     return output
 
 
-def stock_resource_overrides(backup):
+def stock_resource_overrides(backup, source=None, flash=None):
     metadata = json.loads((backup / "installed-imports.json").read_text())
-    by_tag = {item["tag"]: item for item in metadata}
+    if source is None:
+        wanted = {"midi", "song1-track0", "song1-track1"}
+        metadata = [entry for entry in metadata if entry["tag"] in wanted]
+    else:
+        wanted = {tag for _, tag in flash.source_imports(source.encode())}
     overrides = {}
-    for tag, filename in RESOURCE_FILES.items():
-        path = backup / filename
+    for entry in metadata:
+        tag = entry["tag"]
+        if tag not in wanted or tag in overrides:
+            raise ValueError("unexpected or duplicate preserved resource: " + tag)
+        path = backup / ("installed-" + tag + ".bin")
         data = path.read_bytes()
-        entry = by_tag.get(tag)
-        if entry is None or entry["length"] != len(data) + 1:
+        if entry["length"] != len(data) + 1:
             raise ValueError("preserved resource length mismatch: " + tag)
         if hashlib.sha256(data).hexdigest() != entry["sha256"]:
             raise ValueError("preserved resource hash mismatch: " + tag)
         overrides[tag] = path
+    if overrides.keys() != wanted:
+        raise ValueError("missing preserved resources: " + ", ".join(sorted(wanted - overrides.keys())))
     return overrides
 
 
@@ -322,6 +325,8 @@ def parse_args():
     parser.add_argument("--sample-sha256", help="expected converted sample-stream SHA256")
     parser.add_argument("--resource-backup", type=Path, required=True,
                         help="directory with installed-imports.json and preserved package resources")
+    parser.add_argument("--app-source", type=Path, default=REPO / "app.lisp",
+                        help="target Lisp source with PCM hooks (default: repository app.lisp)")
     parser.add_argument("--base-catalog", type=Path, required=True,
                         help="existing songs.json to preserve and append song 7 to")
     parser.add_argument("--output-dir", type=Path, required=True,
@@ -373,7 +378,7 @@ def main():
         target.setframerate(16000)
         target.writeframes(pcm)
 
-    source_path = REPO / "app.lisp"
+    source_path = args.app_source.resolve()
     default_source = source_path.read_text()
     if "warp-samples-enabled" in default_source or "warp-song-number" in default_source:
         raise ValueError("generic application must not define private playback configuration")
@@ -381,8 +386,8 @@ def main():
         raise ValueError("generic application unexpectedly depends on private sample assets")
 
     flash = load_module(REPO / "tunu-flash.py", "tunu_flash")
-    stock = stock_resource_overrides(args.resource_backup.resolve())
-    default_image = build_image(flash, default_source.encode(), REPO, stock)
+    stock = stock_resource_overrides(args.resource_backup.resolve(), default_source, flash)
+    default_image = build_image(flash, default_source.encode(), source_path.parent, stock)
     private_source = injected_app(default_source)
     private_app = output / "bundle/vesc/app.lisp"
     private_app.write_text(private_source)

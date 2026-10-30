@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Test private-build injection without private media or VESC resources."""
+import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import re
@@ -59,6 +61,40 @@ class PrivateBuilderTests(unittest.TestCase):
             builder.stage_catalog([existing, existing])
         with self.assertRaisesRegex(ValueError, "not a resident sample"):
             builder.stage_catalog([{"number": 7, "source": "builtin-samples", "tracks": [{"file": "a"}]}])
+
+    def test_custom_target_logic_is_preserved_and_music_mismatch_rejected(self):
+        custom = self.default_source.replace('(def shutdown-threshold 2.48)', '(def shutdown-threshold 2.50)')
+        self.assertNotEqual(custom, self.default_source)
+        result = builder.injected_app(custom)
+        self.assertIn('(def shutdown-threshold 2.50)', result)
+        self.assertEqual(builder.extract_defun(custom, 'check-shutdown'), builder.extract_defun(result, 'check-shutdown'))
+        self.assertEqual(builder.extract_defun(custom, 'play-current-song'), builder.extract_defun(result, 'play-current-song'))
+        changed_music = custom.replace('(defun stop-music () {', '(defun stop-music () { (print "target")', 1)
+        self.assertNotEqual(changed_music, custom)
+        with self.assertRaisesRegex(ValueError, 'target music function differs'):
+            builder.injected_app(changed_music)
+        with self.assertRaisesRegex(ValueError, 'injection point'):
+            builder.injected_app(custom.replace('; @private-warp-init', ''))
+
+    def test_all_target_resources_are_preserved(self):
+        flash = builder.load_module(ROOT / 'tunu-flash.py', 'pcm_target_flash')
+        source = self.default_source + '\n(import "extra.bin" \'target-extra)\n'
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            metadata = []
+            for _, tag in flash.source_imports(source.encode()):
+                data = ('resource-' + tag).encode()
+                (root / ('installed-' + tag + '.bin')).write_bytes(data)
+                metadata.append({'tag': tag, 'length': len(data) + 1, 'sha256': hashlib.sha256(data).hexdigest()})
+            (root / 'installed-imports.json').write_text(json.dumps(metadata))
+            self.assertEqual(set(builder.stock_resource_overrides(root, source, flash)),
+                             {entry['tag'] for entry in metadata})
+            (root / 'installed-target-extra.bin').write_bytes(b'x' * len(b'resource-target-extra'))
+            with self.assertRaisesRegex(ValueError, 'hash mismatch'):
+                builder.stock_resource_overrides(root, source, flash)
+            (root / 'installed-imports.json').write_text(json.dumps(metadata[:-1]))
+            with self.assertRaisesRegex(ValueError, 'missing preserved resources'):
+                builder.stock_resource_overrides(root, source, flash)
 
     def test_reusable_tools_have_no_machine_specific_paths(self):
         for path in (ROOT / "tools/warp-sound/build_private.py",
