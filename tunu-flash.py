@@ -21,6 +21,11 @@ Usage (run CAN commands on the MDB):
     tunu-flash.py stats                       lisp engine stats + global bindings
     tunu-flash.py read > current.lisp         read back the installed script
     tunu-flash.py read --blob > backup.blob   preserve source and all imports
+    tunu-flash.py read --backup-dir backup    save source, imports and rollback image
+    tunu-flash.py extract backup.blob -o resources
+                                               extract a complete readback offline
+    tunu-flash.py extract app.lisp --source --resource-root /path/to/resources -o resources
+                                               resolve source imports offline
     tunu-flash.py build app.lisp -o app.img   build an image offline
     tunu-flash.py build --blob backup.blob -o rollback.img
                                                wrap a complete readback for rollback
@@ -74,6 +79,7 @@ even with no script installed.
 
 import argparse
 import errno
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -593,6 +599,44 @@ def build_image(source_bytes, base_dir=".", resource_root=None, overrides=None):
     return image_from_blob(bytes(blob))
 
 
+def extract_imports(blob, output, include_backup=False):
+    """Write a new private resource backup, including the import terminators in metadata."""
+    source, imports = unpack_blob(blob)
+    expected = {tag for _, tag in source_imports(source)}
+    if expected != imports.keys():
+        raise ValueError("source imports do not match image table")
+    output = Path(output)
+    output.mkdir(mode=0o700)
+    created = []
+    try:
+        def put(name, data):
+            path = output / name
+            with path.open("xb") as stream:
+                created.append(path)
+                stream.write(data)
+            path.chmod(0o600)
+
+        put("before.lisp", source)
+        if include_backup:
+            image, _ = image_from_blob(blob)
+            validate_image(image)
+            put("before.blob", blob)
+            put("rollback.img", image)
+        metadata = []
+        for tag, data in imports.items():
+            raw = data[:-1]
+            put("installed-" + tag + ".bin", raw)
+            metadata.append({"tag": tag, "length": len(data),
+                             "sha256": hashlib.sha256(raw).hexdigest()})
+        put("installed-imports.json", (json.dumps(metadata, indent=2) + "\n").encode())
+    except Exception:
+        for path in reversed(created):
+            path.unlink()
+        output.rmdir()
+        raise
+    return len(imports)
+
+
 def cmd_output_disable(v, ms):
     """Call (app-disable-output ms) via the REPL. ms=0 re-enables output
     immediately, ms>0 disables it for that long. Returns True when the
@@ -687,7 +731,9 @@ def main():
     p = sub.add_parser("repl"); p.add_argument("expr")
     sub.add_parser("stats")
     p = sub.add_parser("read")
-    p.add_argument("--blob", action="store_true", help="include the import table and data")
+    read_mode = p.add_mutually_exclusive_group()
+    read_mode.add_argument("--blob", action="store_true", help="include the import table and data")
+    read_mode.add_argument("--backup-dir", help="new private directory for source, imports, blob and rollback image")
     for name in ("write", "build"):
         p = sub.add_parser(name)
         p.add_argument("file")
@@ -701,6 +747,13 @@ def main():
         else:
             p.add_argument("-o", "--output", required=True)
             p.add_argument("--blob", action="store_true", help="wrap a READ_CODE backup as an image")
+    p = sub.add_parser("extract", help="extract imports from a readback or resolve a Lisp source offline")
+    p.add_argument("file", help="READ_CODE blob, or Lisp source with --source")
+    p.add_argument("-o", "--output", required=True, help="new private output directory")
+    p.add_argument("--source", action="store_true", help="resolve imports from Lisp source instead of a blob")
+    p.add_argument("--resource-root", help="directory containing vesc_packages/ (requires --source)")
+    p.add_argument("--import", dest="imports", action="append", default=[], metavar="TAG=FILE",
+                   help="use a local raw file for an import tag (requires --source)")
     p = sub.add_parser("output")
     p.add_argument("state", choices=["on", "off"])
     p.add_argument("seconds", nargs="?", type=int, default=120)
@@ -736,6 +789,28 @@ def main():
             Path(args.output).write_bytes(image)
             print("built %d-byte image" % len(image), file=sys.stderr)
             return 0
+
+    if args.cmd == "extract":
+        if not args.source and (args.resource_root or args.imports):
+            ap.error("--resource-root and --import require --source")
+        overrides = {}
+        for spec in args.imports:
+            tag, sep, path = spec.partition("=")
+            if not sep or not path or tag in overrides:
+                ap.error("--import requires unique TAG=FILE entries")
+            overrides[tag] = path
+        try:
+            data = Path(args.file).read_bytes()
+            if args.source:
+                _, data = build_image(data, Path(args.file).resolve().parent, args.resource_root, overrides)
+            count = extract_imports(data, args.output)
+        except (ValueError, OSError, UnicodeError, zlib.error) as error:
+            ap.error(str(error))
+        print("extracted %d imports into %s" % (count, args.output), file=sys.stderr)
+        return 0
+
+    if args.cmd == "read" and args.backup_dir and os.path.lexists(args.backup_dir):
+        ap.error("backup directory already exists: %s" % args.backup_dir)
 
     # `engine` subcommand is a thin wrapper, no CAN.
     if args.cmd == "engine":
@@ -786,7 +861,10 @@ def main():
 
         elif args.cmd == "read":
             blob = cmd_read(v)
-            if args.blob:
+            if args.backup_dir:
+                count = extract_imports(blob, args.backup_dir, include_backup=True)
+                print("saved source, rollback and %d imports in %s" % (count, args.backup_dir), file=sys.stderr)
+            elif args.blob:
                 sys.stdout.buffer.write(blob)
             else:
                 source = blob.split(b"\x00", 1)[0]

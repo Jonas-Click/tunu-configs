@@ -298,6 +298,22 @@ def build_image(flash, source, base_dir, stock_overrides, samples=None):
     return image
 
 
+def stage_catalog(base_catalog):
+    if not isinstance(base_catalog, list) or any(not isinstance(item, dict) for item in base_catalog):
+        raise ValueError("base catalogue must be an array of song objects")
+    matches = [item for item in base_catalog if item.get("number") == SONG_ID]
+    if len(matches) > 1:
+        raise ValueError("song number %d appears more than once" % SONG_ID)
+    if matches:
+        existing = matches[0]
+        if existing.get("source") != "builtin-samples" or existing.get("tracks"):
+            raise ValueError("song number %d is not a resident sample entry" % SONG_ID)
+        return list(base_catalog)
+    if ENTRY["name"] in [item.get("name") for item in base_catalog]:
+        raise ValueError("song name already exists in the base catalogue")
+    return list(base_catalog) + [ENTRY]
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
@@ -323,13 +339,7 @@ def main():
     if args.sample_stream:
         args.sample_stream = require_private_path(args.sample_stream, "sample stream")
     base_catalog = json.loads(args.base_catalog.read_text())
-    if not isinstance(base_catalog, list) or any(not isinstance(item, dict) for item in base_catalog):
-        raise ValueError("base catalogue must be an array of song objects")
-    ids = [item.get("number") for item in base_catalog]
-    if SONG_ID in ids:
-        raise ValueError("song number %d already exists in the base catalogue" % SONG_ID)
-    if ENTRY["name"] in [item.get("name") for item in base_catalog]:
-        raise ValueError("song name already exists in the base catalogue")
+    catalog = stage_catalog(base_catalog)
 
     if args.source_audio:
         converter = load_module(Path(__file__).with_name("convert_audio.py"), "warp_convert_audio")
@@ -380,8 +390,6 @@ def main():
     image_path = output / "bundle/vesc/warp-sample.img"
     image_path.write_bytes(image)
 
-    catalog = list(base_catalog)
-    catalog.append(ENTRY)
     stage = output / "bundle/music-service"
     stage.mkdir(parents=True, exist_ok=True)
     (stage / "songs.json").write_text(json.dumps(catalog, indent=2) + "\n")
@@ -395,7 +403,7 @@ def main():
     print("default app image: %d bytes; private sample app image: %d/%d bytes" %
           (len(default_image), len(image), limit))
     print("staged sample song %d; preserved %d existing catalogue entries" %
-          (SONG_ID, len(catalog) - 1))
+          (SONG_ID, len(base_catalog)))
     print("private image: %s sha256=%s" % (image_path, hashlib.sha256(image).hexdigest()))
     print("sample stream sha256=%s" % sample_digest)
     print("preview: %s" % preview)

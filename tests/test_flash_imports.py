@@ -127,6 +127,80 @@ class ImportTests(unittest.TestCase):
             engine.assert_not_called()
             can.assert_not_called()
 
+    def test_extract_source_and_blob_without_hardware(self):
+        source = self.root / "app.lisp"
+        source.write_text('(import "native.bin" \'lib)')
+        _, blob = flash.build_image(source.read_bytes(), self.root)
+        blob_path = self.root / "before.blob"
+        blob_path.write_bytes(blob)
+        for arguments in ([str(blob_path)], [str(source), "--source"]):
+            with self.subTest(arguments=arguments):
+                output = self.root / ("extracted-blob" if arguments[0] == str(blob_path) else "extracted-source")
+                with patch.object(sys, "argv", ["tunu-flash.py", "extract", *arguments, "-o", str(output)]), \
+                     patch.object(flash, "engine_set") as engine, patch.object(flash, "VescCan") as can:
+                    self.assertEqual(flash.main(), 0)
+                    engine.assert_not_called()
+                    can.assert_not_called()
+                self.assertEqual((output / "before.lisp").read_bytes(), source.read_bytes())
+                self.assertEqual((output / "installed-lib.bin").read_bytes(), (self.root / "native.bin").read_bytes())
+                metadata = flash.json.loads((output / "installed-imports.json").read_text())
+                self.assertEqual(metadata[0]["length"], 5)
+                self.assertEqual(metadata[0]["sha256"], flash.hashlib.sha256((self.root / "native.bin").read_bytes()).hexdigest())
+                self.assertEqual(output.stat().st_mode & 0o777, 0o700)
+                self.assertEqual((output / "installed-lib.bin").stat().st_mode & 0o777, 0o600)
+
+    def test_extract_package_member_and_invalid_or_existing_destination(self):
+        self.package()
+        source = self.root / "app.lisp"
+        source.write_text('(import "pkg::lib@://test.vescpkg" \'midi)')
+        output = self.root / "resources"
+        with patch.object(sys, "argv", ["tunu-flash.py", "extract", str(source), "--source", "--resource-root", str(self.root), "-o", str(output)]):
+            self.assertEqual(flash.main(), 0)
+        self.assertEqual((output / "installed-midi.bin").read_bytes(), (self.root / "native.bin").read_bytes())
+        with self.assertRaises(FileExistsError):
+            flash.extract_imports(flash.build_image(b"(print 1)")[1], output)
+        bad = self.root / "bad.blob"
+        bad.write_bytes(b"not a blob")
+        with patch.object(sys, "argv", ["tunu-flash.py", "extract", str(bad), "-o", str(self.root / "bad-output")]), \
+             patch.object(flash, "engine_set") as engine, patch.object(flash, "VescCan") as can:
+            with self.assertRaises(SystemExit):
+                flash.main()
+            engine.assert_not_called()
+            can.assert_not_called()
+        self.assertFalse((self.root / "bad-output").exists())
+
+    def test_backup_writes_readback_and_valid_rollback(self):
+        source = b'(import "native.bin" \'lib)'
+        _, blob = flash.build_image(source, self.root)
+        output = self.root / "backup"
+        self.assertEqual(flash.extract_imports(blob, output, include_backup=True), 1)
+        self.assertEqual((output / "before.blob").read_bytes(), blob)
+        self.assertEqual(flash.validate_image((output / "rollback.img").read_bytes()), blob)
+        self.assertEqual((output / "before.lisp").read_bytes(), source)
+        self.assertEqual((output / "installed-lib.bin").read_bytes(), (self.root / "native.bin").read_bytes())
+
+    def test_read_backup_cli_captures_full_image(self):
+        source = b'(import "native.bin" \'lib)'
+        _, blob = flash.build_image(source, self.root)
+        output = self.root / "controller-backup"
+        with patch.object(sys, "argv", ["tunu-flash.py", "--no-engine", "read", "--backup-dir", str(output)]), \
+             patch.object(flash, "VescCan") as can, patch.object(flash, "cmd_read", return_value=blob), \
+             patch.object(flash, "engine_set") as engine:
+            self.assertEqual(flash.main(), 0)
+            engine.assert_not_called()
+            can.return_value.close.assert_called_once()
+        self.assertEqual((output / "before.lisp").read_bytes(), source)
+        self.assertEqual((output / "before.blob").read_bytes(), blob)
+        self.assertEqual(flash.validate_image((output / "rollback.img").read_bytes()), blob)
+
+    def test_read_existing_backup_dir_refuses_before_power(self):
+        with patch.object(sys, "argv", ["tunu-flash.py", "read", "--backup-dir", str(self.root)]), \
+             patch.object(flash, "engine_set") as engine, patch.object(flash, "VescCan") as can:
+            with self.assertRaises(SystemExit):
+                flash.main()
+            engine.assert_not_called()
+            can.assert_not_called()
+
     def test_offline_build_and_backup_restore(self):
         path = self.root / "app.lisp"
         output = self.root / "app.image"

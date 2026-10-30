@@ -10,7 +10,30 @@ The repository contains reusable conversion and opt-in build tools, not a record
 - For a complete image, a private resource-backup directory containing `installed-imports.json`, `installed-midi.bin`, `installed-song1-track0.bin`, and `installed-song1-track1.bin` from the target readback. These captured binaries are build inputs only and must not be copied into this repository.
 - A base music-service `songs.json` to preserve.
 
-## Reproduce a private build
+## Prepare resources
+
+For a target whose ECU is already powered safely, this reads the installed app over CAN and saves its Lisp source, complete blob, rollback image and individual imports in a new private directory:
+
+```sh
+python3 tunu-flash.py --no-engine read --backup-dir /private/target-backup
+```
+
+The saved source is `/private/target-backup/before.lisp`. The directory must not already exist. For a previously captured `read --blob` file, extract imports offline instead:
+
+```sh
+python3 tunu-flash.py extract /private/before.blob -o /private/resources
+```
+
+For a fresh build with local VESC Tool packages, resolve the generic source's imports without a scooter:
+
+```sh
+python3 tunu-flash.py extract app.lisp --source \
+  --resource-root /path/to/resources -o /private/resources
+```
+
+The resource root must contain `vesc_packages/`. `--import TAG=FILE` can replace an individual package import with a raw local file. No packages are downloaded. A native MIDI library must match the target firmware.
+
+## Build the sample image
 
 Choose private paths for the audio file, resource backups, base catalogue, and output directory. The output directory must be outside this repository. A newly created output directory is restricted to mode `0700`; an existing directory with group/other access is rejected without changing it. Record `ffmpeg -version` alongside build results when exact reproduction matters.
 
@@ -38,7 +61,7 @@ python3 tools/warp-sound/build_private.py \
 
 Alternatively, use `--source-audio "$SOURCE_AUDIO"` instead of `--sample-stream` to convert during the build. The expected digest is optional for the builder; when omitted, it prints the converted sample digest. `--sample-sha256` verifies a previously recorded digest.
 
-The builder rejects a catalogue where song 7 or `TNG Warp 2` already exists. It preserves existing entries, injects private sample imports/player/dispatch only into the generated app, separately builds the generic app without sample files, validates preserved resources against readback metadata, checks image imports including their NUL terminators, and enforces VESC image capacity. It writes the preview, sample chunks, app image/source, staged catalogue, and disabled event extension only to the selected private output directory. It never writes to a vehicle.
+The builder preserves an existing song 7 if it is a trackless `builtin-samples` entry, including its name and other fields. If song 7 is used for anything else, it refuses to overwrite it. If song 7 is absent, it adds the sample entry unless its name is already used elsewhere. It injects sample imports/player/dispatch only into the generated app, separately builds the generic app without sample files, validates preserved resources against metadata, checks image imports including their NUL terminators, and enforces VESC image capacity. It writes the preview, sample chunks, app image/source, staged catalogue, and disabled event extension only to the selected private output directory. It never writes to a vehicle. The generated image uses the repository's generic `app.lisp`, not the captured `before.lisp`. Compare and preserve target-specific shutdown, temperature, calibration, odometer and other behavior before considering an upload; do not replace a customized app blindly.
 
 ## Offline checks
 

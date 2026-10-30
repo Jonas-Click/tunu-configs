@@ -47,6 +47,19 @@ class PrivateBuilderTests(unittest.TestCase):
         self.assertIn("(var generation (advance-music-generation))",
                       builder.PRIVATE_FUNCTIONS["play-axelf"])
 
+    def test_existing_sample_catalog_entry_is_preserved(self):
+        existing = {"number": 7, "name": "Space Whoosh", "source": "builtin-samples", "default": "tng-warp2"}
+        base = [{"number": 1, "name": "Axel F"}, existing]
+        self.assertEqual(builder.stage_catalog(base), base)
+        self.assertEqual(base[1], existing)
+        self.assertEqual(builder.stage_catalog([base[0]])[-1], builder.ENTRY)
+        with self.assertRaisesRegex(ValueError, "not a resident sample"):
+            builder.stage_catalog([{"number": 7, "name": "other", "tracks": [{"file": "a"}]}])
+        with self.assertRaisesRegex(ValueError, "more than once"):
+            builder.stage_catalog([existing, existing])
+        with self.assertRaisesRegex(ValueError, "not a resident sample"):
+            builder.stage_catalog([{"number": 7, "source": "builtin-samples", "tracks": [{"file": "a"}]}])
+
     def test_reusable_tools_have_no_machine_specific_paths(self):
         for path in (ROOT / "tools/warp-sound/build_private.py",
                      ROOT / "tools/warp-sound/convert_audio.py",
