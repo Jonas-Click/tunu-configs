@@ -2,6 +2,34 @@
 
 The repository contains reusable conversion and opt-in build tools, not a recording or captured VESC package binaries. Normal app builds and tests need none of the private inputs or FFmpeg. Keep supplied audio, converted samples, native resource backups, catalogues containing private entries, and generated bundles outside Git. No project-wide license or redistribution permission for a supplied recording is implied.
 
+## Quick start
+
+Run from the repository root on the MDB, with the ECU already safely powered, the vehicle stationary and locked, and OTA idle. Set `SAMPLE` to a signed 8-bit mono 16 kHz PCM file with exactly 44,160 bytes. The controller must already have compatible native MIDI imports.
+
+```sh
+SAMPLE=/path/to/sample.s8
+WORK="/data/tunu-pcm-$(date +%s)"; mkdir -m 700 "$WORK"
+
+python3 tunu-flash.py --no-engine read --backup-dir "$WORK/backup"
+
+python3 tools/warp-sound/build_private.py \
+  --app-source "$WORK/backup/before.lisp" \
+  --resource-backup "$WORK/backup" \
+  --sample-stream "$SAMPLE" \
+  --base-catalog /data/music-service/songs.json \
+  --output-dir "$WORK/build"
+
+python3 tunu-flash.py --no-engine write \
+  --image "$WORK/build/bundle/vesc/warp-sample.img" \
+  --keep-output-disabled
+
+cp -p /data/music-service/songs.json "$WORK/songs.before.json"
+cp "$WORK/build/bundle/music-service/songs.json" /data/music-service/songs.json
+systemctl restart music-service
+```
+
+The backup contains the original Lisp source, all imports and a rollback image. The builder rejects incompatible source hooks, changed shared music functions, missing resources and a conflicting song 7; it does not overwrite the input source or catalogue. Review the generated source before uploading. Output inhibition expires after 120 seconds, so check controller faults, settings, odometer and a cold-boot readback before returning the vehicle to use. If rolling back, upload `$WORK/backup/rollback.img` and restore `$WORK/songs.before.json`. The event-trigger extension remains disabled until explicitly configured.
+
 ## Requirements
 
 - Python 3 with its standard library.
@@ -10,7 +38,30 @@ The repository contains reusable conversion and opt-in build tools, not a record
 - For a complete image, a private resource-backup directory containing `installed-imports.json`, `installed-midi.bin`, `installed-song1-track0.bin`, and `installed-song1-track1.bin` from the target readback. These captured binaries are build inputs only and must not be copied into this repository.
 - A base music-service `songs.json` to preserve.
 
-## Reproduce a private build
+## Prepare resources
+
+For a target whose ECU is already powered safely, this reads the installed app over CAN and saves its Lisp source, complete blob, rollback image and individual imports in a new private directory:
+
+```sh
+python3 tunu-flash.py --no-engine read --backup-dir /private/target-backup
+```
+
+The saved source is `/private/target-backup/before.lisp`. The directory must not already exist. For a previously captured `read --blob` file, extract imports offline instead:
+
+```sh
+python3 tunu-flash.py extract /private/before.blob -o /private/resources
+```
+
+For a fresh build with local VESC Tool packages, resolve the generic source's imports without a scooter:
+
+```sh
+python3 tunu-flash.py extract app.lisp --source \
+  --resource-root /path/to/resources -o /private/resources
+```
+
+The resource root must contain `vesc_packages/`. `--import TAG=FILE` can replace an individual package import with a raw local file. No packages are downloaded. A native MIDI library must match the target firmware.
+
+## Build the sample image
 
 Choose private paths for the audio file, resource backups, base catalogue, and output directory. The output directory must be outside this repository. A newly created output directory is restricted to mode `0700`; an existing directory with group/other access is rejected without changing it. Record `ffmpeg -version` alongside build results when exact reproduction matters.
 
@@ -32,13 +83,14 @@ python3 tools/warp-sound/build_private.py \
   --sample-stream "$PRIVATE_OUTPUT/warp-sound-16000.s8" \
   --sample-sha256 "$EXPECTED_SAMPLE_SHA256" \
   --resource-backup "$RESOURCE_BACKUP" \
+  --app-source "$RESOURCE_BACKUP/before.lisp" \
   --base-catalog "$BASE_CATALOG" \
   --output-dir "$PRIVATE_OUTPUT"
 ```
 
 Alternatively, use `--source-audio "$SOURCE_AUDIO"` instead of `--sample-stream` to convert during the build. The expected digest is optional for the builder; when omitted, it prints the converted sample digest. `--sample-sha256` verifies a previously recorded digest.
 
-The builder rejects a catalogue where song 7 or `TNG Warp 2` already exists. It preserves existing entries, injects private sample imports/player/dispatch only into the generated app, separately builds the generic app without sample files, validates preserved resources against readback metadata, checks image imports including their NUL terminators, and enforces VESC image capacity. It writes the preview, sample chunks, app image/source, staged catalogue, and disabled event extension only to the selected private output directory. It never writes to a vehicle.
+The builder preserves an existing song 7 if it is a trackless `builtin-samples` entry, including its name and other fields. If song 7 is used for anything else, it refuses to overwrite it. If song 7 is absent, it adds the sample entry unless its name is already used elsewhere. It injects sample imports/player/dispatch only into the generated app, separately builds the generic app without sample files, validates preserved resources against metadata, checks image imports including their NUL terminators, and enforces VESC image capacity. It writes the preview, sample chunks, app image/source, staged catalogue, and disabled event extension only to the selected private output directory. It never writes to a vehicle. `--app-source` uses the captured target source instead of the generic repository app. The source must contain all PCM insertion points and its shared music functions must match the reviewed repository implementation; otherwise the builder refuses to continue. All imports in the source must be present in the backup and match its recorded hashes. Already-sampled images and incompatible custom music code need separate review. Without `--app-source`, the builder uses the generic repository app; do not use that default to replace a customized target blindly.
 
 ## Offline checks
 

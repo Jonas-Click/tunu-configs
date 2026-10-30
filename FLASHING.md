@@ -34,7 +34,22 @@ Missing imports, malformed package tables, invalid CRCs and oversized STM32 imag
 
 ## Back up and upload
 
-With the ECU already powered safely:
+To save the installed Lisp source, blob, rollback image and each individual import in a new private directory, with the ECU already powered safely:
+
+```sh
+python3 tunu-flash.py --no-engine read --backup-dir /private/target-backup
+```
+
+The source is `before.lisp`; raw imports are `installed-TAG.bin`, with lengths and hashes in `installed-imports.json`. The directory must not already exist. To extract a saved blob offline, or resolve imports directly from a source and local VESC packages:
+
+```sh
+python3 tunu-flash.py extract before.blob -o /private/resources
+python3 tunu-flash.py extract app.lisp --source --resource-root /path/to/resources -o /private/resources-from-packages
+```
+
+`extract --source` also accepts repeated `--import TAG=FILE` overrides. It does not connect to the scooter. Neither extraction command overwrites an existing directory.
+
+The equivalent blob-only backup and upload workflow is:
 
 ```sh
 python3 tunu-flash.py --no-engine read --blob > before.blob
