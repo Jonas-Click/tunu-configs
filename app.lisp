@@ -751,13 +751,12 @@
                 (def engine-running t)
                 (engine-start-seq 0)
             })
-            (if (or engine-demo (engine-quiet)) (engine-pause))
+            (atomic (if (or engine-demo (engine-quiet)) (engine-pause)))
             (if (not engine-sounding) (engine-reset))
             (if (and engine-enabled (not engine-demo) (not (engine-quiet))) {
                 (engine-tick (/ (* (abs (get-speed)) 3.6) speed-cal)
                              (engine-clamp (get-adc-decoded 0))
                              (engine-clamp (get-adc-decoded 1)))
-                (def engine-sounding t)
             })
         })
         ((and (not engine-enabled) engine-running) {
