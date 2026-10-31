@@ -87,7 +87,7 @@ PRELUDE = r'''
 
 
 class EngineSoundTests(unittest.TestCase):
-    def selected_source(self):
+    def selected_source(self, fake_clock=True):
         selected = []
         source = Path(os.environ.get('ENGINE_APP_SOURCE', str(ROOT / 'app.lisp')))
         for form in reader.forms(source.read_text()):
@@ -96,19 +96,17 @@ class EngineSoundTests(unittest.TestCase):
                           or match[1] in ('handle-engine-command', 'send-engine-status', 'send-engine-status-locked')):
                 form = form.replace('(ext-midi-open ', '(mock-midi-open ')
                 form = form.replace('(ext-midi-parse parser-idx)', '(mock-midi-parse parser-idx generation)')
-                # Simulated time: sequences and the demo finish instantly, and the
-                # demo runs in the calling thread.
-                form = form.replace('(systime)', '(clock-now)').replace('(secs-since ', '(clock-age ')
-                form = form.replace('(sleep ', '(fake-sleep ')
-                form = form.replace('(spawn 200 engine-demo-run)', '(engine-demo-run)')
+                if fake_clock:
+                    form = form.replace('(systime)', '(clock-now)').replace('(secs-since ', '(clock-age ')
+                    form = form.replace('(sleep ', '(fake-sleep ')
                 selected.append(form)
         return '\n'.join(selected)
 
-    def run_lisp(self, checks):
+    def run_lisp(self, checks, fake_clock=True):
         repl = os.environ.get('LBM_REPL', 'lbm')
         if not shutil.which(repl):
             self.skipTest('set LBM_REPL to the host LispBM executable')
-        program = PRELUDE + '\n' + self.selected_source() + '\n' + checks + """
+        program = PRELUDE + '\n' + self.selected_source(fake_clock) + '\n' + checks + """
 (if (= failures 0) (print "ENGINE_TESTS_PASS") (print (list "ENGINE_TESTS_FAIL" failures)))
 """
         with tempfile.NamedTemporaryFile('w', suffix='.lbm') as script:
@@ -197,6 +195,7 @@ class EngineSoundTests(unittest.TestCase):
 (looprange style 0 5 {
     (def max-voltage-sum 0.0)
     (command 2 100 style)
+    (engine-step)
     (expect (and (not engine-demo) (not engine-sounding) (= (voltage-sum) 0.0)) "demo completes and goes silent")
     (expect (and (> max-voltage-sum 0.0) (<= max-voltage-sum (* 2.2501 (engine-vol-max)))) "voltage within the cap")
 })
@@ -204,6 +203,7 @@ class EngineSoundTests(unittest.TestCase):
 (expect (not engine-enabled) "demo leaves the on/off request unchanged")
 (def music-playing true)
 (command 2 100 0)
+(engine-step)
 (expect (and (not engine-demo) (= (voltage-sum) 0.0)) "a song stops the demo")
 """)
 
@@ -216,6 +216,108 @@ class EngineSoundTests(unittest.TestCase):
 (looprange i 0 50 { (engine-tick 0.0 1.0 0.6) })
 (expect (> engine-rpm (* 1.5 (engine-idle))) "revs at a standstill with the brake held")
 """)
+
+    def test_upload_during_startup_releases_tones(self):
+        self.run_lisp(r"""
+(def interrupted nil)
+(defun fake-sleep (secs) {
+    (def clock (+ clock secs))
+    (if (and (not interrupted) (> (voltage-sum) 0.0)) {
+        (def interrupted t)
+        (def music-upload-last clock)
+        (engine-pause)
+    })
+})
+(engine-init)
+(command 1 100 0)
+(engine-step)
+(expect (and interrupted (engine-quiet) (not engine-sounding) (= (voltage-sum) 0.0)) "upload releases start tones")
+""")
+
+    def test_fault_and_worker_error_during_startup_release_tones(self):
+        self.run_lisp(r"""
+(def interrupted nil)
+(defun fake-sleep (secs) {
+    (def clock (+ clock secs))
+    (if (and (not interrupted) (> (voltage-sum) 0.0)) {
+        (def interrupted t)
+        (def fault 1)
+    })
+})
+(engine-init)
+(command 1 100 0)
+(engine-step)
+(expect (and interrupted (not engine-sounding) (= (voltage-sum) 0.0)) "fault releases start tones")
+(def fault 0)
+(def interrupted nil)
+(defun fake-sleep (secs) {
+    (def clock (+ clock secs))
+    (if (and (not interrupted) (> (voltage-sum) 0.0)) {
+        (def interrupted t)
+        (/ 1 0)
+    })
+})
+(engine-init)
+(command 1 100 0)
+(engine-loop)
+(expect (and interrupted (not engine-enabled) (not engine-sounding) (= (voltage-sum) 0.0)) "error releases start tones")
+""")
+
+    def test_pause_does_not_clear_foreground_notes(self):
+        self.run_lisp(r"""
+(engine-init)
+(engine-raw 100.0 1.0 150.0 1.0 200.0 1.0 250.0 1.0)
+(setix (ix channels 0) 1 60)
+(foc-play-tone 0 261.6 0.7)
+(def music-playing true)
+(engine-pause)
+(expect (and (not engine-sounding) (= (ix voltages 0) 0.7) (= (ix voltages 1) 0.0)) "pause preserves a foreground note")
+""")
+
+    def test_sequences_keep_reporting_status(self):
+        self.run_lisp(r"""
+(engine-init)
+(command 1 50 0)
+(def before status-events)
+(engine-step)
+(expect (>= (- status-events before) 3) "status continues during startup")
+(command 2 50 0)
+(def before status-events)
+(engine-step)
+(expect (>= (- status-events before) 20) "status continues during demo")
+""")
+
+    def test_demo_takes_over_startup_on_the_same_worker(self):
+        self.run_lisp(r"""
+(def renderer 0)
+(def other-writes 0)
+(def demo-runs 0)
+(def original-tone foc-play-tone)
+(def original-demo engine-demo-ride)
+(defun foc-play-tone (channel frequency voltage) {
+    (if (and (> voltage 0.0) (!= (self) renderer))
+        (def other-writes (+ other-writes 1)))
+    (original-tone channel frequency voltage)
+})
+(defun engine-demo-ride () {
+    (def demo-runs (+ demo-runs 1))
+    (original-demo)
+})
+(engine-init)
+(command 1 50 0)
+(def renderer (spawn 300 engine-loop))
+(sleep 0.1)
+(expect (> tone-events 0) "startup is active")
+(command 2 50 0)
+(sleep 0.2)
+(expect (and engine-demo (= demo-runs 1) (= other-writes 0)) "one worker owns startup and demo")
+(command 2 50 0)
+(sleep 0.1)
+(expect (= demo-runs 1) "demo retry does not restart")
+(command 0 50 0)
+(sleep 0.15)
+(expect (not engine-demo) "off cancels the demo")
+""", fake_clock=False)
 
     def test_worker_error_releases_channels(self):
         self.run_lisp(r"""

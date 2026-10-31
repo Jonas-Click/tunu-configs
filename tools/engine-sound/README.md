@@ -13,7 +13,7 @@ The existing standard CAN IDs are retained:
 - `0x4EA`: command (0 off, 1 on, 2 demo), volume percent, optional style (0-4).
 - `0x7ED`: requested on/off state, exact volume percent, demo-active flag, style.
 
-State is echoed after commands and once per second. Duplicate on/off/demo commands do not restart or extend a cue/demo. The demo lasts about 30 seconds, uses simulated inputs only, and leaves the persistent on/off request unchanged. An off command cancels a demo immediately. Start and stop sequences take 1 to 2 seconds.
+State is echoed after commands and once per second, including during start, stop and demo sequences. All sequences run on the engine worker; a demo takes over an in-progress start or stop sequence without a second renderer writing the channels. Duplicate on/off/demo commands do not restart or extend a cue/demo. The demo lasts about 30 seconds, uses simulated inputs only, and leaves the persistent on/off request unchanged. An off command cancels a demo immediately. Start and stop sequences take 1 to 2 seconds.
 
 MIDI, sample playback and pending song starts have priority. Upload traffic also reserves a short quiet interval. Engine audio never writes the shared channels while a foreground player owns them. Natural completion clears the music state only after every track in the current generation has finished; stale same-song tasks cannot parse, emit notes or finish a newer playback. This also lets music-service restore the saved music volume after an unlock melody.
 
@@ -60,4 +60,4 @@ LBM_REPL=/path/to/lispBM/repl/repl PYTHONDONTWRITEBYTECODE=1 \
   python3 -m unittest discover -s tests -p 'test_engine_*.py' -v
 ```
 
-Tests execute the actual controller functions in host LispBM with a simulated clock: commands and status echo, start and stop sequences, malformed commands and volume clamping, silence during songs, song starts, uploads and faults, every style's demo within the voltage cap and frequency range, virtual gears, braked revving and worker-error cleanup. Set `ENGINE_APP_SOURCE` to a generated target app to test those same functions after backporting.
+Tests execute the actual controller functions in host LispBM: commands and periodic status, start and stop sequences, malformed commands and volume clamping, silence during songs, song starts, uploads and faults, every style's demo within the voltage cap and frequency range, virtual gears, braked revving and worker-error cleanup. Simulated-clock tests interrupt startup with uploads, faults and errors; a native-clock test exercises demo handoff on the actual 300-cell worker stack. Set `ENGINE_APP_SOURCE` to a generated target app to test those same functions after backporting.

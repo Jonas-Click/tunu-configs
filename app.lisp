@@ -355,10 +355,7 @@
 
 ; Called when a song starts or an upload begins: release the channels at once.
 (defun engine-pause () {
-    (if engine-sounding {
-        (looprange channel 0 4 { (foc-play-tone channel 500.0 0.0) })
-        (def engine-sounding false)
-    })
+    (if engine-sounding (engine-silence-locked))
 })
 
 (defun engine-init () {
@@ -409,10 +406,7 @@
         })
         (if (!= style engine-style) (engine-set-style style))
         (if (= cmd 2)
-            (if (not engine-demo) {
-                (def engine-demo t)
-                (spawn 200 engine-demo-run)
-            })
+            (def engine-demo t)
             {
                 (def engine-enabled (= cmd 1))
                 (if (= cmd 0) (def engine-demo false))
@@ -497,9 +491,13 @@
 })
 
 ; Silence the engine tones on every channel the music isn't using.
-(defun engine-silence ()
-    (atomic (loopforeach ch channels
-        (if (= (ix ch 1) 0) (foc-play-tone (ix ch 0) 500 0)))))
+(defun engine-silence-locked () {
+    (loopforeach ch channels
+        (if (= (ix ch 1) 0) (foc-play-tone (ix ch 0) 500 0)))
+    (def engine-sounding false)
+})
+
+(defun engine-silence () (atomic (engine-silence-locked)))
 
 ; Start from idle, e.g. when the sound comes back on.
 (defun engine-reset () {
@@ -531,6 +529,7 @@
     (if (> (engine-rasp) 0.0) (setq a (* a (- 1.0 (* (engine-rasp) (engine-rand))))))
     (var tn (engine-tones))
     (atomic (if (not (engine-quiet)) {
+        (def engine-sounding t)
         (foc-play-tone 0 (* f (ix tn 0)) (* a (ix tn 1)))
         (foc-play-tone 1 (* f (ix tn 2)) (* a (ix tn 3)))
         (foc-play-tone 2 (* f (ix tn 4)) (* a (ix tn 5)))
@@ -542,6 +541,7 @@
 ; whine and thud, chime, sweep). Amplitudes are fractions of engine-vol.
 (defun engine-raw (f0 a0 f1 a1 f2 a2 f3 a3)
     (atomic (if (not (engine-quiet)) {
+        (def engine-sounding t)
         (foc-play-tone 0 f0 (* engine-vol a0))
         (foc-play-tone 1 f1 (* engine-vol a1))
         (foc-play-tone 2 f2 (* engine-vol a2))
@@ -551,11 +551,16 @@
 ; Can a sequence step run? mode 0: start (while switched on), 1: stop (while
 ; switched off), 2: demo (while the demo runs). A song, an upload or a fault
 ; always wins.
-(defun engine-seq-ok (mode)
+(defun engine-report-if-due ()
+    (if (>= (secs-since engine-last-status) 1.0) (send-engine-status)))
+
+(defun engine-seq-ok (mode) {
+    (engine-report-if-due)
     (and (not (engine-quiet))
-         (cond ((= mode 0) engine-enabled)
-               ((= mode 1) (not engine-enabled))
-               (t engine-demo))))
+         (cond ((= mode 0) (and engine-enabled (not engine-demo)))
+               ((= mode 1) (and (not engine-enabled) (not engine-demo)))
+               (t engine-demo)))
+})
 
 (defun engine-in (x lst) {
     (var found nil)
@@ -735,18 +740,20 @@
 ; 50 Hz loop. Switching on plays the start sound, switching off the stop sound.
 ; While a song plays (or starts, or uploads) or the controller reports a fault,
 ; the engine stays silent and resumes without a new start sound; the music's
-; own note-on/decay-loop own the channels then. While the demo plays, the demo
-; thread drives the tones instead. Engine_Status is repeated once per second.
+; own note-on/decay-loop own the channels then. Start, stop and demo sequences
+; all run on this worker, so only one renderer owns the tones and model state.
+; Engine_Status is repeated once per second, including during sequences.
 (defun engine-step () {
     (cond
-        (engine-demo nil)
+        (engine-demo (engine-demo-run))
         ((and engine-enabled (not (engine-quiet))) {
             (if (not engine-running) {
                 (def engine-running t)
                 (engine-start-seq 0)
             })
+            (if (or engine-demo (engine-quiet)) (engine-pause))
             (if (not engine-sounding) (engine-reset))
-            (if (and engine-enabled (not (engine-quiet))) {
+            (if (and engine-enabled (not engine-demo) (not (engine-quiet))) {
                 (engine-tick (/ (* (abs (get-speed)) 3.6) speed-cal)
                              (engine-clamp (get-adc-decoded 0))
                              (engine-clamp (get-adc-decoded 1)))
@@ -763,7 +770,7 @@
             (engine-silence)
             (def engine-sounding nil)
         }))
-    (if (>= (secs-since engine-last-status) 1.0) (send-engine-status))
+    (engine-report-if-due)
 })
 
 ; If the loop ever stops with an error, it releases the channels and reports off.
