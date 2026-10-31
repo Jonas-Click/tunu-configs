@@ -11,8 +11,10 @@ import struct
 import wave
 
 REPO = Path(__file__).resolve().parents[2]
-SONG_ID = 7
-ENTRY = {"number": SONG_ID, "name": "TNG Warp 2", "source": "builtin-samples"}
+SONG_ID = 240
+PCM_MIN_ID = 240
+PCM_MAX_ID = 255
+ENTRY = {"number": SONG_ID, "name": "Space Whoosh", "source": "builtin-samples"}
 SAMPLE_BYTES = 44160
 CHUNK_BYTES = 4000
 IMPORTS = "\n".join(
@@ -203,11 +205,16 @@ PRIVATE_FUNCTIONS = {name: extract_defun((REPO / 'app.lisp').read_text(), name)
                      for name in ('stop-music', 'play-current-song', 'play-axelf')}
 
 
-def injected_app(source):
+def injected_app(source, song_number=SONG_ID):
     for name, snippet in PRIVATE_FUNCTIONS.items():
         if extract_defun(source, name) != snippet:
             raise ValueError("target music function differs from reviewed source: " + name)
+    if not PCM_MIN_ID <= song_number <= PCM_MAX_ID:
+        raise ValueError("sample song number must be in the range 240-255")
     for marker, snippet in MARKERS.items():
+        if marker == "; @private-warp-config":
+            snippet = snippet.replace("(def warp-song-number %d)" % SONG_ID,
+                                      "(def warp-song-number %d)" % song_number)
         if source.count(marker) != 1:
             raise ValueError("expected exactly one app injection point: " + marker)
         source = source.replace(marker, snippet)
@@ -301,20 +308,56 @@ def build_image(flash, source, base_dir, stock_overrides, samples=None):
     return image
 
 
-def stage_catalog(base_catalog):
+def stage_catalog(base_catalog, song_number=SONG_ID, migrate_legacy=False):
     if not isinstance(base_catalog, list) or any(not isinstance(item, dict) for item in base_catalog):
         raise ValueError("base catalogue must be an array of song objects")
-    matches = [item for item in base_catalog if item.get("number") == SONG_ID]
+    if not PCM_MIN_ID <= song_number <= PCM_MAX_ID:
+        raise ValueError("sample song number must be in the range 240-255")
+    matches = [item for item in base_catalog if item.get("number") == song_number]
     if len(matches) > 1:
-        raise ValueError("song number %d appears more than once" % SONG_ID)
+        raise ValueError("song number %d appears more than once" % song_number)
+    legacy = [item for item in base_catalog if item.get("number") == 7
+              and item.get("source") == "builtin-samples" and not item.get("tracks")
+              and (item.get("default") == "tng-warp2" or item.get("name") in ("TNG Warp 2", "Space Whoosh"))]
+    if legacy:
+        if not migrate_legacy:
+            raise ValueError("legacy sample at 7: use --migrate-legacy only when updating the controller and trigger together")
+        if matches:
+            raise ValueError("cannot migrate legacy sample: song number %d is already in use" % song_number)
+        return [dict(item, number=song_number) if item is legacy[0] else item for item in base_catalog]
     if matches:
         existing = matches[0]
         if existing.get("source") != "builtin-samples" or existing.get("tracks"):
-            raise ValueError("song number %d is not a resident sample entry" % SONG_ID)
+            raise ValueError("song number %d is not a resident sample entry" % song_number)
         return list(base_catalog)
     if ENTRY["name"] in [item.get("name") for item in base_catalog]:
         raise ValueError("song name already exists in the base catalogue")
-    return list(base_catalog) + [ENTRY]
+    return list(base_catalog) + [dict(ENTRY, number=song_number)]
+
+
+def upgrade_existing_app(source, song_number):
+    if not PCM_MIN_ID <= song_number <= PCM_MAX_ID:
+        raise ValueError("sample song number must be in the range 240-255")
+    if source.count("(def warp-samples-enabled true)") != 1:
+        raise ValueError("expected an enabled resident sample app")
+    for name in ("play-warp-samples", "play-warp-samples-track", "warp-finish-if-current"):
+        extract_defun(source, name)
+    source, count = re.subn(r"^\(def warp-song-number (?:7|24[0-9]|25[0-5])\)$",
+                            "(def warp-song-number %d)" % song_number, source, flags=re.M)
+    if count != 1:
+        raise ValueError("expected one supported existing sample song number")
+    upload = extract_defun(source, "handle-upload-begin")
+    old = "(if music-playing (stop-music))"
+    fixed = "(if (or music-playing music-starting) (stop-music))"
+    if old in upload:
+        if upload.count(old) != 1:
+            raise ValueError("ambiguous upload stop hook")
+        source = replace_defun(source, "handle-upload-begin", upload.replace(old, fixed))
+    elif fixed not in upload and not re.search(
+            r'\(if\s+\(or music-playing music-starting\)\s*\{\s*'
+            r'\(stop-music\)\s*\(send-music-status\)\s*\}\)', upload):
+        raise ValueError("unrecognized upload stop hook")
+    return source
 
 
 def parse_args():
@@ -327,8 +370,14 @@ def parse_args():
                         help="directory with installed-imports.json and preserved package resources")
     parser.add_argument("--app-source", type=Path, default=REPO / "app.lisp",
                         help="target Lisp source with PCM hooks (default: repository app.lisp)")
+    parser.add_argument("--song-number", type=int, default=SONG_ID,
+                        help="resident sample number, 240-255 (default: 240)")
+    parser.add_argument("--upgrade-existing-pcm", action="store_true",
+                        help="update a backed-up PCM app while preserving its target-specific source")
+    parser.add_argument("--migrate-legacy", action="store_true",
+                        help="move a recognized legacy sample entry at 7 in the staged catalogue")
     parser.add_argument("--base-catalog", type=Path, required=True,
-                        help="existing songs.json to preserve and append song 7 to")
+                        help="existing songs.json to preserve and stage the sample entry")
     parser.add_argument("--output-dir", type=Path, required=True,
                         help="private output directory outside the repository")
     return parser.parse_args()
@@ -344,7 +393,7 @@ def main():
     if args.sample_stream:
         args.sample_stream = require_private_path(args.sample_stream, "sample stream")
     base_catalog = json.loads(args.base_catalog.read_text())
-    catalog = stage_catalog(base_catalog)
+    catalog = stage_catalog(base_catalog, args.song_number, args.migrate_legacy)
 
     if args.source_audio:
         converter = load_module(Path(__file__).with_name("convert_audio.py"), "warp_convert_audio")
@@ -380,15 +429,22 @@ def main():
 
     source_path = args.app_source.resolve()
     default_source = source_path.read_text()
-    if "warp-samples-enabled" in default_source or "warp-song-number" in default_source:
-        raise ValueError("generic application must not define private playback configuration")
-    if "samples/warp-sample-" in default_source or "@private-warp-dispatch" not in default_source:
-        raise ValueError("generic application unexpectedly depends on private sample assets")
-
     flash = load_module(REPO / "tunu-flash.py", "tunu_flash")
     stock = stock_resource_overrides(args.resource_backup.resolve(), default_source, flash)
     default_image = build_image(flash, default_source.encode(), source_path.parent, stock)
-    private_source = injected_app(default_source)
+    if args.upgrade_existing_pcm:
+        expected_tags = {"warp-sample-%d" % i for i in range(12)}
+        if not expected_tags.issubset(stock):
+            raise ValueError("existing PCM app is missing sample imports")
+        if b"".join(stock["warp-sample-%d" % i].read_bytes() for i in range(12)) != sample:
+            raise ValueError("sample stream differs from target backup")
+        private_source = upgrade_existing_app(default_source, args.song_number)
+    else:
+        if "warp-samples-enabled" in default_source or "warp-song-number" in default_source:
+            raise ValueError("source already has PCM; use --upgrade-existing-pcm after review")
+        if "samples/warp-sample-" in default_source or "@private-warp-dispatch" not in default_source:
+            raise ValueError("source lacks unused PCM insertion points")
+        private_source = injected_app(default_source, args.song_number)
     private_app = output / "bundle/vesc/app.lisp"
     private_app.write_text(private_source)
     image = build_image(flash, private_source.encode(), private_app.parent, stock, chunks)
@@ -400,15 +456,19 @@ def main():
     (stage / "songs.json").write_text(json.dumps(catalog, indent=2) + "\n")
     extension_dir = output / "bundle/extensions"
     extension_dir.mkdir(parents=True, exist_ok=True)
-    for name in ("warp-sound.py", "warp-sound.toml"):
-        shutil.copy2(REPO / "extensions" / name, extension_dir / name)
+    trigger = (REPO / "extensions/warp-sound.py").read_text()
+    old_number = "SONG_NUMBER = 240"
+    if trigger.count(old_number) != 1:
+        raise ValueError("expected one default trigger song number")
+    (extension_dir / "warp-sound.py").write_text(trigger.replace(old_number, "SONG_NUMBER = %d" % args.song_number))
+    shutil.copy2(REPO / "extensions/warp-sound.toml", extension_dir / "warp-sound.toml")
     limit = flash.MAX_IMAGE_SIZE
     if len(image) > limit:
         raise ValueError("private image exceeds VESC image capacity")
     print("default app image: %d bytes; private sample app image: %d/%d bytes" %
           (len(default_image), len(image), limit))
     print("staged sample song %d; preserved %d existing catalogue entries" %
-          (SONG_ID, len(base_catalog)))
+          (args.song_number, len(base_catalog)))
     print("private image: %s sha256=%s" % (image_path, hashlib.sha256(image).hexdigest()))
     print("sample stream sha256=%s" % sample_digest)
     print("preview: %s" % preview)
