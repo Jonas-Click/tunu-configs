@@ -319,6 +319,33 @@ class EngineSoundTests(unittest.TestCase):
 (expect (not engine-demo) "off cancels the demo")
 """, fake_clock=False)
 
+    def test_all_sequences_fit_controller_worker_stack(self):
+        self.run_lisp(r"""
+(engine-init)
+(def worker-done false)
+(def worker-result nil)
+(spawn 300 (fn () {
+    (def worker-result (trap {
+        (looprange style 0 5 {
+            (command 1 100 style)
+            (engine-step)
+            (command 2 100 style)
+            (engine-step)
+            (command 0 100 style)
+            (engine-step)
+        })
+        t
+    }))
+    (def worker-done true)
+}))
+(looprange i 0 500 {
+    (if worker-done (break))
+    (sleep 0.01)
+})
+(expect (and worker-done (eq worker-result '(exit-ok t))) "all sequences fit 300-cell worker")
+(expect (= (voltage-sum) 0.0) "worker ends silent")
+""")
+
     def test_worker_error_releases_channels(self):
         self.run_lisp(r"""
 (engine-init)
